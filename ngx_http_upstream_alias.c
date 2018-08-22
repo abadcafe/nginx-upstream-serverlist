@@ -13,7 +13,7 @@ typedef struct {
     ngx_http_upstream_srv_conf_t *upstream_conf;
     ngx_str_t                     name;
     ngx_event_t                   connect_timer;
-    ngx_event_t                   comm_timer;
+    ngx_event_t                   timeout_timer;
 
     ngx_peer_connection_t         peer_conn;
     ngx_buf_t                     send;
@@ -47,6 +47,9 @@ init_process(ngx_cycle_t *cycle);
 
 static void
 exit_process(ngx_cycle_t *cycle);
+
+static void
+connect_timeout_clean(ngx_event_t *ev);
 
 static void
 connect_to_alias_service(ngx_event_t *ev);
@@ -232,7 +235,7 @@ init_process(ngx_cycle_t *cycle) {
     ngx_http_upstream_alias_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_alias_module);
     ngx_http_upstream_alias_t           *aliases = main_cf->aliases.elts;
     ngx_uint_t i;
-    ngx_event_t *connect_timer;
+    ngx_event_t *connect_timer, *timeout_timer;
     ngx_uint_t refresh_in;
 
     for (i = 0; i < main_cf->aliases.nelts; i++) {
@@ -240,6 +243,11 @@ init_process(ngx_cycle_t *cycle) {
         connect_timer->handler = connect_to_alias_service;
         connect_timer->log = cycle->log;
         connect_timer->data = &aliases[i];
+
+        timeout_timer = &aliases[i].timeout_timer;
+        timeout_timer->handler = connect_timeout_clean;
+        timeout_timer->log = cycle->log;
+        timeout_timer->data = &aliases[i];
 
         refresh_in = random_interval();
         ngx_log_debug(NGX_LOG_INFO, cycle->log, 0,
@@ -263,6 +271,26 @@ exit_process(ngx_cycle_t *cycle) {
             aliases[i].pool = NULL;
         }
     }
+}
+
+static void
+connect_timeout_clean(ngx_event_t *ev) {
+    ngx_http_upstream_alias_t *alias = ev->data;
+
+    ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-alias: alias %V timeout",
+                  &alias->name);
+
+    if (alias->peer_conn.connection != NULL) {
+        ngx_close_connection(alias->peer_conn.connection);
+        alias->peer_conn.connection = NULL;
+    }
+
+    if (alias->new_pool != NULL) {
+        ngx_destroy_pool(alias->new_pool);
+        alias->new_pool = NULL;
+    }
+
+    ngx_add_timer(&alias->connect_timer, random_interval());
 }
 
 static void
@@ -292,7 +320,7 @@ connect_to_alias_service(ngx_event_t *ev) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                       "upstream-alias: connection of alias %V is existing",
                       &alias->name);
-        ngx_close_connection(c);
+        ngx_close_connection(alias->peer_conn.connection);
         alias->peer_conn.connection = NULL;
     }
 
@@ -309,6 +337,7 @@ connect_to_alias_service(ngx_event_t *ev) {
     alias->peer_conn.sockaddr = &main_cf->alias_service_url.sockaddr.sockaddr;
     alias->peer_conn.socklen = main_cf->alias_service_url.socklen;
 
+    ngx_add_timer(&alias->timeout_timer, 10000);
     ret = ngx_event_connect_peer(&alias->peer_conn);
     if (ret == NGX_ERROR || ret == NGX_DECLINED) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
@@ -324,7 +353,6 @@ connect_to_alias_service(ngx_event_t *ev) {
         goto fail;
     }
 
-    /* NGX_OK or NGX_AGAIN */
     c = alias->peer_conn.connection;
     c->data = alias;
     c->log = alias->peer_conn.log;
@@ -345,6 +373,7 @@ connect_to_alias_service(ngx_event_t *ev) {
 fail:
     ngx_close_connection(c);
     alias->peer_conn.connection = NULL;
+    ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
 }
 
@@ -395,6 +424,7 @@ fail:
     alias->peer_conn.connection = NULL;
     ngx_destroy_pool(alias->new_pool);
     alias->new_pool = NULL;
+    ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
 }
 
@@ -452,13 +482,7 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
         ngx_int_t second_arg_found = 0;
         u_char *line_pos = curr_line.data;
         u_char *line_end = curr_line.data + curr_line.len;
-        do {
-            ngx_memzero(&curr_arg, sizeof curr_arg);
-            line_pos = get_one_arg(line_pos, line_end, &curr_arg);
-            if (line_pos == NULL) {
-                break;
-            }
-
+        while ((line_pos = get_one_arg(line_pos, line_end, &curr_arg)) != NULL) {
             if (!first_arg_found) {
                 if (ngx_strncmp(curr_arg.data, "server", curr_arg.len) != 0) {
                     ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
@@ -546,7 +570,7 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                                   &alias->name, &curr_arg);
                 }
             }
-        } while (line_pos != line_end);
+        }
     } while (body_pos < body_end);
 
     return servers;
@@ -596,12 +620,14 @@ refresh_upstream(ngx_http_upstream_alias_t *alias) {
     }
     alias->pool = alias->new_pool;
     alias->new_pool = NULL;
+    ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
     return;
 
 fail:
     ngx_destroy_pool(alias->new_pool);
     alias->new_pool = NULL;
+    ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
 }
 
@@ -707,6 +733,7 @@ fail:
     alias->peer_conn.connection = NULL;
     ngx_destroy_pool(alias->new_pool);
     alias->new_pool = NULL;
+    ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
 }
 
