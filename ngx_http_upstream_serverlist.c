@@ -19,13 +19,14 @@ typedef struct {
     ngx_buf_t                     send;
     ngx_buf_t                     recv;
     ngx_str_t                     body;
-} ngx_http_upstream_alias_t;
+} ngx_http_upstream_serverlist_t;
 
 typedef struct {
-    ngx_url_t                     alias_service_url;
-    ngx_array_t                   aliases;
+    ngx_url_t                     service_url;
+    ngx_str_t                     dump_path;
+    ngx_array_t                   serverlists;
     ngx_http_conf_ctx_t          *conf_ctx;
-} ngx_http_upstream_alias_main_conf_t;
+} ngx_http_upstream_serverlist_main_conf_t;
 
 static void *
 create_main_conf(ngx_conf_t *cf);
@@ -34,10 +35,10 @@ static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child);
 
 static char *
-alias_service_url_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy);
+serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy);
 
 static char *
-alias_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy);
+serverlist_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy);
 
 static char *
 dump_upstreams_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -52,30 +53,30 @@ static void
 connect_timeout_clean(ngx_event_t *ev);
 
 static void
-connect_to_alias_service(ngx_event_t *ev);
+connect_to_service(ngx_event_t *ev);
 
 static void
-send_request_to_alias_service(ngx_event_t *ev);
+send_to_service(ngx_event_t *ev);
 
 static void
-recv_response_from_alias_service(ngx_event_t *ev);
+recv_from_service(ngx_event_t *ev);
 
 static void
 empty_handler(ngx_event_t *ev);
 
 static ngx_command_t module_commands[] = {
     {
-        ngx_string("alias"),
+        ngx_string("serverlist"),
         NGX_HTTP_UPS_CONF | NGX_CONF_ANY,
-        alias_directive,
+        serverlist_directive,
         0,
         0,
         NULL
     },
     {
-        ngx_string("alias_service_url"),
+        ngx_string("serverlist_service"),
         NGX_HTTP_MAIN_CONF | NGX_CONF_1MORE,
-        alias_service_url_directive,
+        serverlist_service_directive,
         0,
         0,
         NULL
@@ -105,7 +106,7 @@ static ngx_http_module_t module_ctx = {
     NULL                                   /* merge location configuration */
 };
 
-ngx_module_t ngx_http_upstream_alias_module = {
+ngx_module_t ngx_http_upstream_serverlist_module = {
     NGX_MODULE_V1,
     &module_ctx,                           /* module context */
     module_commands,                       /* module directives */
@@ -136,36 +137,37 @@ whole_world_exiting() {
 
 static void *
 create_main_conf(ngx_conf_t *cf) {
-    ngx_http_upstream_alias_main_conf_t *main_cf;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf;
 
     main_cf = ngx_pcalloc(cf->pool, sizeof *main_cf);
     if (main_cf == NULL) {
         return NULL;
     }
 
-    if (ngx_array_init(&main_cf->aliases, cf->pool, 1,
-                       sizeof(ngx_http_upstream_alias_t)) != NGX_OK) {
+    if (ngx_array_init(&main_cf->serverlists, cf->pool, 1,
+                       sizeof(ngx_http_upstream_serverlist_t)) != NGX_OK) {
         return NULL;
     }
 
-    ngx_memzero(&main_cf->alias_service_url, sizeof main_cf->alias_service_url);
-    ngx_str_set(&main_cf->alias_service_url.url, "127.84.10.13/");
+    ngx_memzero(&main_cf->service_url, sizeof main_cf->service_url);
+    ngx_str_set(&main_cf->service_url.url, "127.84.10.13/");
+    ngx_memzero(&main_cf->dump_path, sizeof main_cf->dump_path);
 
     return main_cf;
 }
 
 static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
-    ngx_http_upstream_alias_main_conf_t  *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_alias_module);
-    ngx_int_t                             ret = -1;
+    ngx_http_upstream_serverlist_main_conf_t  *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
+    ngx_int_t                                  ret = -1;
 
-    main_cf->alias_service_url.default_port = 80;
-    main_cf->alias_service_url.uri_part = 1;
-    ret = ngx_parse_url(cf->pool, &main_cf->alias_service_url);
+    main_cf->service_url.default_port = 80;
+    main_cf->service_url.uri_part = 1;
+    ret = ngx_parse_url(cf->pool, &main_cf->service_url);
     if (ret != NGX_OK) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-alias: parse alias_service_url failed: %s",
-                           main_cf->alias_service_url.err);
+                           "upstream-serverlist: parse service url failed: %s",
+                           main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
@@ -173,86 +175,86 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
 }
 
 static char *
-alias_service_url_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
-    ngx_http_upstream_alias_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_alias_module);
-    ngx_str_t                           *url = (ngx_str_t *)cf->args->elts + 1;
+serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
+    ngx_str_t                                *url = (ngx_str_t *)cf->args->elts + 1;
 
     if (cf->args->nelts < 2) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-alias: alias_service_url need 1 arg",
-                           main_cf->alias_service_url.err);
+                           "upstream-serverlist: serverlist_service need 1 arg",
+                           main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
     if (url->len <= 7) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-alias: alias_service_url error",
-                           main_cf->alias_service_url.err);
+                           "upstream-serverlist: serverlist_service error",
+                           main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
     if (ngx_strncasecmp(url->data, (u_char *)"http://", 7) != 0) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-alias: alias_service_url needs http prefix",
-                           main_cf->alias_service_url.err);
+                           "upstream-serverlist: serverlist_service needs http prefix",
+                           main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
-    main_cf->alias_service_url.url.data = url->data + 7;
-    main_cf->alias_service_url.url.len = url->len - 7;
+    main_cf->service_url.url.data = url->data + 7;
+    main_cf->service_url.url.len = url->len - 7;
 
     return NGX_CONF_OK;
 }
 
 static char *
-alias_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
-    ngx_http_upstream_srv_conf_t        *uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
-    ngx_http_upstream_alias_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_alias_module);
-    ngx_http_upstream_alias_t           *alias = NULL;
+serverlist_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
+    ngx_http_upstream_srv_conf_t             *uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_serverlist_t           *serverlist = NULL;
 
     if (cf->args->nelts > 2) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-alias: alias only need 0 or 1 args",
-                           main_cf->alias_service_url.err);
+                           "upstream-serverlist: serverlist only need 0 or 1 args",
+                           main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
-    alias = ngx_array_push(&main_cf->aliases);
-    if (alias == NULL) {
+    serverlist = ngx_array_push(&main_cf->serverlists);
+    if (serverlist == NULL) {
         return NGX_CONF_ERROR;
     }
 
-    ngx_memzero(alias, sizeof *alias);
-    alias->upstream_conf = uscf;
-    alias->name = cf->args->nelts <= 1 ? uscf->host :
-                                         ((ngx_str_t *)cf->args->elts)[1];
+    ngx_memzero(serverlist, sizeof *serverlist);
+    serverlist->upstream_conf = uscf;
+    serverlist->name = cf->args->nelts <= 1 ? uscf->host :
+                                              ((ngx_str_t *)cf->args->elts)[1];
 
     return NGX_CONF_OK;
 }
 
 static ngx_int_t
 init_process(ngx_cycle_t *cycle) {
-    ngx_http_upstream_alias_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_alias_module);
-    ngx_http_upstream_alias_t           *aliases = main_cf->aliases.elts;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_serverlist_t           *serverlists = main_cf->serverlists.elts;
     ngx_uint_t i;
-    ngx_event_t *connect_timer, *timeout_timer;
+    ngx_event_t *connect_timer = NULL, *timeout_timer = NULL;
     ngx_uint_t refresh_in;
 
-    for (i = 0; i < main_cf->aliases.nelts; i++) {
-        connect_timer = &aliases[i].connect_timer;
-        connect_timer->handler = connect_to_alias_service;
+    for (i = 0; i < main_cf->serverlists.nelts; i++) {
+        connect_timer = &serverlists[i].connect_timer;
+        connect_timer->handler = connect_to_service;
         connect_timer->log = cycle->log;
-        connect_timer->data = &aliases[i];
+        connect_timer->data = &serverlists[i];
 
-        timeout_timer = &aliases[i].timeout_timer;
+        timeout_timer = &serverlists[i].timeout_timer;
         timeout_timer->handler = connect_timeout_clean;
         timeout_timer->log = cycle->log;
-        timeout_timer->data = &aliases[i];
+        timeout_timer->data = &serverlists[i];
 
         refresh_in = random_interval();
         ngx_log_debug(NGX_LOG_INFO, cycle->log, 0,
-                      "upstream-alias: Initialize refresh alias '%V' in %ims",
-                      &aliases[i].name, refresh_in);
+                      "upstream-serverlist: Initialize refresh serverlist '%V' in %ims",
+                      &serverlists[i].name, refresh_in);
         ngx_add_timer(connect_timer, refresh_in);
     }
 
@@ -261,107 +263,109 @@ init_process(ngx_cycle_t *cycle) {
 
 static void
 exit_process(ngx_cycle_t *cycle) {
-    ngx_http_upstream_alias_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_alias_module);
-    ngx_http_upstream_alias_t           *aliases = main_cf->aliases.elts;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_serverlist_t           *serverlists = main_cf->serverlists.elts;
     ngx_uint_t i;
 
-    for (i = 0; i < main_cf->aliases.nelts; i++) {
-        if (aliases[i].pool) {
-            ngx_destroy_pool(aliases[i].pool);
-            aliases[i].pool = NULL;
+    for (i = 0; i < main_cf->serverlists.nelts; i++) {
+        if (serverlists[i].pool) {
+            ngx_destroy_pool(serverlists[i].pool);
+            serverlists[i].pool = NULL;
         }
     }
 }
 
 static void
 connect_timeout_clean(ngx_event_t *ev) {
-    ngx_http_upstream_alias_t *alias = ev->data;
+    ngx_http_upstream_serverlist_t *serverlist = ev->data;
 
-    ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-alias: alias %V timeout",
-                  &alias->name);
+    ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                  "upstream-serverlist: serverlist %V timeout",
+                  &serverlist->name);
 
-    if (alias->peer_conn.connection != NULL) {
-        ngx_close_connection(alias->peer_conn.connection);
-        alias->peer_conn.connection = NULL;
+    if (serverlist->peer_conn.connection != NULL) {
+        ngx_close_connection(serverlist->peer_conn.connection);
+        serverlist->peer_conn.connection = NULL;
     }
 
-    if (alias->new_pool != NULL) {
-        ngx_destroy_pool(alias->new_pool);
-        alias->new_pool = NULL;
+    if (serverlist->new_pool != NULL) {
+        ngx_destroy_pool(serverlist->new_pool);
+        serverlist->new_pool = NULL;
     }
 
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
 }
 
 static void
-connect_to_alias_service(ngx_event_t *ev) {
+connect_to_service(ngx_event_t *ev) {
     ngx_int_t                                 ret = -1;
     ngx_connection_t                         *c = NULL;
-    ngx_http_upstream_alias_main_conf_t      *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_alias_module);
-    ngx_http_upstream_alias_t                *alias = ev->data;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_serverlist_t           *serverlist = ev->data;
 
     if (whole_world_exiting()) {
         return;
     }
 
     ngx_log_debug(NGX_LOG_INFO, ev->log, 0,
-                  "upstream-alias: start refresh alias '%V'", &alias->name);
+                  "upstream-serverlist: start refresh serverlist %V",
+                  &serverlist->name);
 
-    if (alias->new_pool != NULL) {
+    if (serverlist->new_pool != NULL) {
         // the new pool may existed while previous refresh procedure failed.
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: new pool of alias %V is existing",
-                      &alias->name);
-        ngx_destroy_pool(alias->new_pool);
-        alias->new_pool = NULL;
+                      "upstream-serverlist: new pool of serverlist %V is existing",
+                      &serverlist->name);
+        ngx_destroy_pool(serverlist->new_pool);
+        serverlist->new_pool = NULL;
     }
 
-    if (alias->peer_conn.connection != NULL) {
+    if (serverlist->peer_conn.connection != NULL) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: connection of alias %V is existing",
-                      &alias->name);
-        ngx_close_connection(alias->peer_conn.connection);
-        alias->peer_conn.connection = NULL;
+                      "upstream-serverlist: connection of serverlist %V is existing",
+                      &serverlist->name);
+        ngx_close_connection(serverlist->peer_conn.connection);
+        serverlist->peer_conn.connection = NULL;
     }
 
-    ngx_memzero(&alias->peer_conn, sizeof alias->peer_conn);
-    ngx_memzero(&alias->send, sizeof alias->send);
-    ngx_memzero(&alias->recv, sizeof alias->recv);
-    ngx_memzero(&alias->body, sizeof alias->body);
-    alias->peer_conn.get = ngx_event_get_peer;
-    alias->peer_conn.log = ev->log;
-    alias->peer_conn.log_error = NGX_ERROR_ERR;
-    alias->peer_conn.cached = 0;
-    alias->peer_conn.connection = NULL;
-    alias->peer_conn.name = &main_cf->alias_service_url.host;
-    alias->peer_conn.sockaddr = &main_cf->alias_service_url.sockaddr.sockaddr;
-    alias->peer_conn.socklen = main_cf->alias_service_url.socklen;
+    ngx_memzero(&serverlist->peer_conn, sizeof serverlist->peer_conn);
+    ngx_memzero(&serverlist->send, sizeof serverlist->send);
+    ngx_memzero(&serverlist->recv, sizeof serverlist->recv);
+    ngx_memzero(&serverlist->body, sizeof serverlist->body);
+    serverlist->peer_conn.get = ngx_event_get_peer;
+    serverlist->peer_conn.log = ev->log;
+    serverlist->peer_conn.log_error = NGX_ERROR_ERR;
+    serverlist->peer_conn.cached = 0;
+    serverlist->peer_conn.connection = NULL;
+    serverlist->peer_conn.name = &main_cf->service_url.host;
+    serverlist->peer_conn.sockaddr = &main_cf->service_url.sockaddr.sockaddr;
+    serverlist->peer_conn.socklen = main_cf->service_url.socklen;
 
-    ngx_add_timer(&alias->timeout_timer, 10000);
-    ret = ngx_event_connect_peer(&alias->peer_conn);
+    ngx_add_timer(&serverlist->timeout_timer, 10000);
+    ret = ngx_event_connect_peer(&serverlist->peer_conn);
     if (ret == NGX_ERROR || ret == NGX_DECLINED) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: connect to alias_service_url failed: %V",
-                      &alias->peer_conn.name);
+                      "upstream-serverlist: connect to service_url failed: %V",
+                      &serverlist->peer_conn.name);
         goto fail;
     }
 
-    alias->new_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ev->log);
-    if (alias->new_pool == NULL) {
+    serverlist->new_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ev->log);
+    if (serverlist->new_pool == NULL) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: Could not create new pool");
+                      "upstream-serverlist: Could not create new pool");
         goto fail;
     }
 
-    c = alias->peer_conn.connection;
-    c->data = alias;
-    c->log = alias->peer_conn.log;
+    c = serverlist->peer_conn.connection;
+    c->data = serverlist;
+    c->log = serverlist->peer_conn.log;
     c->sendfile = 0;
     c->idle = 1; // for quick exit.
     c->read->log = c->log;
     c->write->log = c->log;
-    c->write->handler = send_request_to_alias_service;
-    c->read->handler = recv_response_from_alias_service;
+    c->write->handler = send_to_service;
+    c->read->handler = recv_from_service;
 
     /* The kqueue's loop interface needs it. */
     if (ret == NGX_OK) {
@@ -371,61 +375,61 @@ connect_to_alias_service(ngx_event_t *ev) {
     return;
 
 fail:
-    ngx_close_connection(alias->peer_conn.connection);
-    alias->peer_conn.connection = NULL;
-    ngx_del_timer(&alias->timeout_timer);
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    ngx_close_connection(serverlist->peer_conn.connection);
+    serverlist->peer_conn.connection = NULL;
+    ngx_del_timer(&serverlist->timeout_timer);
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
 }
 
 static void
-send_request_to_alias_service(ngx_event_t *ev) {
+send_to_service(ngx_event_t *ev) {
     ssize_t                                   size;
     ngx_connection_t                         *c = ev->data;
-    ngx_http_upstream_alias_t                *alias = c->data;
-    ngx_http_upstream_alias_main_conf_t      *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_alias_module);
+    ngx_http_upstream_serverlist_t           *serverlist = c->data;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
 
     if (whole_world_exiting()) {
         return;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "upstream-alias: sending");
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "upstream-serverlist: sending");
 
     u_char req[ngx_pagesize];
     ngx_memzero(req, sizeof req);
-    ngx_sprintf(req, "GET %V?alias=%V HTTP/1.0\r\nHost: %V\r\n\r\n",
-                &main_cf->alias_service_url.uri, &alias->name,
-                &main_cf->alias_service_url.host);
+    ngx_sprintf(req, "GET %V?serverlist=%V HTTP/1.0\r\nHost: %V\r\n\r\n",
+                &main_cf->service_url.uri, &serverlist->name,
+                &main_cf->service_url.host);
 
-    alias->send.pos = req;
-    alias->send.last = alias->send.pos + ngx_strlen(req);
-    while (alias->send.pos < alias->send.last) {
-        size = c->send(c, alias->send.pos, alias->send.last - alias->send.pos);
+    serverlist->send.pos = req;
+    serverlist->send.last = serverlist->send.pos + ngx_strlen(req);
+    while (serverlist->send.pos < serverlist->send.last) {
+        size = c->send(c, serverlist->send.pos, serverlist->send.last - serverlist->send.pos);
         if (size > 0) {
-            alias->send.pos += size;
+            serverlist->send.pos += size;
         } else if (size == 0 || size == NGX_AGAIN) {
             return;
         } else {
             c->error = 1;
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-alias: send error");
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-serverlist: send error");
             goto fail;
         }
     }
 
-    if (alias->send.pos == alias->send.last) {
+    if (serverlist->send.pos == serverlist->send.last) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "upstream_alias_send: sent");
+                       "upstream_serverlist_send: sent");
     }
 
     c->write->handler = empty_handler;
     return;
 
 fail:
-    ngx_close_connection(alias->peer_conn.connection);
-    alias->peer_conn.connection = NULL;
-    ngx_destroy_pool(alias->new_pool);
-    alias->new_pool = NULL;
-    ngx_del_timer(&alias->timeout_timer);
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    ngx_close_connection(serverlist->peer_conn.connection);
+    serverlist->peer_conn.connection = NULL;
+    ngx_destroy_pool(serverlist->new_pool);
+    serverlist->new_pool = NULL;
+    ngx_del_timer(&serverlist->timeout_timer);
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
 }
 
 static u_char *
@@ -464,17 +468,17 @@ get_one_line(u_char *buf, u_char *buf_end, ngx_str_t *line) {
 }
 
 static ngx_array_t *
-get_alias_servers(ngx_http_upstream_alias_t *alias) {
+get_servers(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_int_t    ret = -1;
-    ngx_array_t *servers = ngx_array_create(alias->new_pool, 2,
+    ngx_array_t *servers = ngx_array_create(serverlist->new_pool, 2,
                                             sizeof(ngx_http_upstream_server_t));
     ngx_http_upstream_server_t *server = NULL;
     ngx_url_t u = {0};
     ngx_str_t curr_line = {0};
     ngx_str_t curr_arg = {0};
 
-    u_char *body_pos = alias->body.data;
-    u_char *body_end = alias->body.data + alias->body.len;
+    u_char *body_pos = serverlist->body.data;
+    u_char *body_end = serverlist->body.data + serverlist->body.len;
     do {
         ngx_memzero(&curr_line, sizeof curr_line);
         body_pos = get_one_line(body_pos, body_end, &curr_line);
@@ -485,9 +489,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
         while ((line_pos = get_one_arg(line_pos, line_end, &curr_arg)) != NULL) {
             if (!first_arg_found) {
                 if (ngx_strncmp(curr_arg.data, "server", curr_arg.len) != 0) {
-                    ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                  "upstream-alias: alias %V: expect 'server' prefix",
-                                  &alias->name);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                  "upstream-serverlist: serverlist %V: expect 'server' prefix",
+                                  &serverlist->name);
                     break;
                 }
 
@@ -497,11 +501,11 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 u.url = curr_arg;
                 u.no_resolve = 1;
                 u.default_port = 80;
-                ret = ngx_parse_url(alias->new_pool, &u);
+                ret = ngx_parse_url(serverlist->new_pool, &u);
                 if (ret != NGX_OK) {
-                    ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                  "upstream-alias: alias %V: parse addr failed",
-                                  &alias->name);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                  "upstream-serverlist: serverlist %V: parse addr failed",
+                                  &serverlist->name);
                     break;
                 }
 
@@ -522,9 +526,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 if (ngx_strncmp(curr_arg.data, "weight=", 7) == 0) {
                     ret = ngx_atoi(curr_arg.data + 7, curr_arg.len - 7);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                      "upstream-alias: alias %V: weight invalid",
-                                      &alias->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                      "upstream-serverlist: serverlist %V: weight invalid",
+                                      &serverlist->name);
                         continue;
                     }
 
@@ -533,9 +537,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 } else if (ngx_strncmp(curr_arg.data, "max_conns=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                      "upstream-alias: alias %V: max_conns invalid",
-                                      &alias->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                      "upstream-serverlist: serverlist %V: max_conns invalid",
+                                      &serverlist->name);
                         continue;
                     }
 
@@ -544,9 +548,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 } else if (ngx_strncmp(curr_arg.data, "max_fails=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                      "upstream-alias: alias %V: max_fails invalid",
-                                      &alias->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                      "upstream-serverlist: serverlist %V: max_fails invalid",
+                                      &serverlist->name);
                         continue;
                     }
 
@@ -555,9 +559,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                     ngx_str_t time_str = {.data = curr_arg.data + 13, .len = curr_arg.len - 13};
                     ret = (ngx_int_t)ngx_parse_time(&time_str, 1);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                      "upstream-alias: alias %V: fail_timeout invalid",
-                                      &alias->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                      "upstream-serverlist: serverlist %V: fail_timeout invalid",
+                                      &serverlist->name);
                         continue;
                     }
 
@@ -569,9 +573,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 } else if (curr_arg.len == 1 && curr_arg.data[0] == ';') {
                     continue;
                 } else {
-                    ngx_log_error(NGX_LOG_ERR, alias->connect_timer.log, 0,
-                                  "upstream-alias: alias %V: unknown server option %V",
-                                  &alias->name, &curr_arg);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
+                                  "upstream-serverlist: serverlist %V: unknown server option %V",
+                                  &serverlist->name, &curr_arg);
                 }
             }
         }
@@ -581,67 +585,67 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
 }
 
 static void
-refresh_upstream(ngx_http_upstream_alias_t *alias) {
-    ngx_http_upstream_alias_main_conf_t  *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_alias_module);
-    ngx_http_upstream_srv_conf_t         *uscf = alias->upstream_conf;
-    ngx_array_t                          *new_servers = NULL;
-    ngx_conf_t                            cf = {0};
+refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_srv_conf_t             *uscf = serverlist->upstream_conf;
+    ngx_array_t                              *new_servers = NULL;
+    ngx_conf_t                                cf = {0};
 
     if (whole_world_exiting()) {
         return;
     }
 
-    new_servers = get_alias_servers(alias);
+    new_servers = get_servers(serverlist);
     if (new_servers == NULL || new_servers->nelts <= 0) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upstream-alias: Could not get servers of alias %V",
-                      &alias->name);
+                      "upstream-serverlist: Could not get servers of serverlist %V",
+                      &serverlist->name);
         goto fail;
     }
     uscf->servers = new_servers;
 
     ngx_memzero(&cf, sizeof cf);
-    cf.name = "alias_init_upstream";
+    cf.name = "serverlist_init_upstream";
     cf.cycle = (ngx_cycle_t *) ngx_cycle;
-    cf.pool = alias->new_pool;
+    cf.pool = serverlist->new_pool;
     cf.module_type = NGX_HTTP_MODULE;
     cf.cmd_type = NGX_HTTP_MAIN_CONF;
     cf.log = ngx_cycle->log;
     cf.ctx = main_cf->conf_ctx;
 
     ngx_http_upstream_init_pt init;
-    init = alias->upstream_conf->peer.init_upstream ?
-        alias->upstream_conf->peer.init_upstream :
+    init = serverlist->upstream_conf->peer.init_upstream ?
+        serverlist->upstream_conf->peer.init_upstream :
         ngx_http_upstream_init_round_robin;
 
     if (init(&cf, uscf) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upstream-alias: Error re-initializing upstream");
+                      "upstream-serverlist: Error re-initializing upstream");
     }
 
-    if (alias->pool != NULL) {
-        ngx_destroy_pool(alias->pool);
+    if (serverlist->pool != NULL) {
+        ngx_destroy_pool(serverlist->pool);
     }
-    alias->pool = alias->new_pool;
-    alias->new_pool = NULL;
-    ngx_del_timer(&alias->timeout_timer);
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    serverlist->pool = serverlist->new_pool;
+    serverlist->new_pool = NULL;
+    ngx_del_timer(&serverlist->timeout_timer);
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
     return;
 
 fail:
-    ngx_destroy_pool(alias->new_pool);
-    alias->new_pool = NULL;
-    ngx_del_timer(&alias->timeout_timer);
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    ngx_destroy_pool(serverlist->new_pool);
+    serverlist->new_pool = NULL;
+    ngx_del_timer(&serverlist->timeout_timer);
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
 }
 
 static void
-recv_response_from_alias_service(ngx_event_t *ev) {
+recv_from_service(ngx_event_t *ev) {
     ngx_int_t                              ret = -1;
     u_char                                *new_buf;
     ssize_t                                size, n;
     ngx_connection_t                      *c = ev->data;
-    ngx_http_upstream_alias_t             *alias = c->data;
+    ngx_http_upstream_serverlist_t        *serverlist = c->data;
 
     int minor_version = 0, status = 0;
     struct phr_header headers[32] = {0};
@@ -652,41 +656,41 @@ recv_response_from_alias_service(ngx_event_t *ev) {
         return;
     }
 
-    if (alias->recv.start == NULL) {
+    if (serverlist->recv.start == NULL) {
         /* 1 of the page_size, is it enough? */
-        alias->recv.start = ngx_pcalloc(alias->new_pool, ngx_pagesize);
-        if (alias->recv.start == NULL) {
+        serverlist->recv.start = ngx_pcalloc(serverlist->new_pool, ngx_pagesize);
+        if (serverlist->recv.start == NULL) {
             goto fail;
         }
 
-        alias->recv.last = alias->recv.pos = alias->recv.start;
-        alias->recv.end = alias->recv.start + ngx_pagesize;
+        serverlist->recv.last = serverlist->recv.pos = serverlist->recv.start;
+        serverlist->recv.end = serverlist->recv.start + ngx_pagesize;
     }
 
     while (1) {
-        n = alias->recv.end - alias->recv.last;
+        n = serverlist->recv.end - serverlist->recv.last;
 
         /* buffer not big enough? enlarge it by twice */
         if (n == 0) {
-            size = alias->recv.end - alias->recv.start;
-            new_buf = ngx_pcalloc(alias->new_pool, size * 2);
+            size = serverlist->recv.end - serverlist->recv.start;
+            new_buf = ngx_pcalloc(serverlist->new_pool, size * 2);
             if (new_buf == NULL) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                              "upstream-alias: allocate recv buf failed");
+                              "upstream-serverlist: allocate recv buf failed");
                 goto fail;
             }
-            ngx_memcpy(new_buf, alias->recv.start, size);
+            ngx_memcpy(new_buf, serverlist->recv.start, size);
 
-            alias->recv.pos = alias->recv.start = new_buf;
-            alias->recv.last = new_buf + size;
-            alias->recv.end = new_buf + size * 2;
+            serverlist->recv.pos = serverlist->recv.start = new_buf;
+            serverlist->recv.last = new_buf + size;
+            serverlist->recv.end = new_buf + size * 2;
 
-            n = alias->recv.end - alias->recv.last;
+            n = serverlist->recv.end - serverlist->recv.last;
         }
 
-        size = c->recv(c, alias->recv.last, n);
+        size = c->recv(c, serverlist->recv.last, n);
         if (size > 0) {
-            alias->recv.last += size;
+            serverlist->recv.last += size;
             continue;
         } else if (size == 0) {
             break;
@@ -694,57 +698,57 @@ recv_response_from_alias_service(ngx_event_t *ev) {
             return;
         } else {
             c->error = 1;
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-alias: recv error");
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-serverlist: recv error");
             goto fail;
         }
     }
 
-    ret = phr_parse_response((const char *)alias->recv.pos,
-                             alias->recv.last - alias->recv.pos,
+    ret = phr_parse_response((const char *)serverlist->recv.pos,
+                             serverlist->recv.last - serverlist->recv.pos,
                              &minor_version, &status, &msg, &msg_len, headers,
                              &num_headers, 0);
     if (ret == -1) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: parse http headers of alias %V error",
-                      &alias->name);
+                      "upstream-serverlist: parse http headers of serverlist %V error",
+                      &serverlist->name);
         goto fail;
     } else if (ret == -2) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: response of alias %V is incomplete",
-                      &alias->name);
+                      "upstream-serverlist: response of serverlist %V is incomplete",
+                      &serverlist->name);
         goto fail;
     } else if (ret < 0) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: unknown picohttpparser error in alias %V",
-                      &alias->name);
+                      "upstream-serverlist: unknown picohttpparser error in serverlist %V",
+                      &serverlist->name);
         goto fail;
     } else if (status != 200) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: response of alias %V is not 200: %d",
-                      &alias->name, status);
+                      "upstream-serverlist: response of serverlist %V is not 200: %d",
+                      &serverlist->name, status);
         goto fail;
     }
-    alias->body.data = (u_char *)alias->recv.pos + ret;
-    alias->body.len = alias->recv.last - alias->recv.pos - ret;
+    serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
+    serverlist->body.len = serverlist->recv.last - serverlist->recv.pos - ret;
 
     c->read->handler = empty_handler;
-    ngx_close_connection(alias->peer_conn.connection);
-    alias->peer_conn.connection = NULL;
-    refresh_upstream(alias);
+    ngx_close_connection(serverlist->peer_conn.connection);
+    serverlist->peer_conn.connection = NULL;
+    refresh_upstream(serverlist);
     return;
 
 fail:
-    ngx_close_connection(alias->peer_conn.connection);
-    alias->peer_conn.connection = NULL;
-    ngx_destroy_pool(alias->new_pool);
-    alias->new_pool = NULL;
-    ngx_del_timer(&alias->timeout_timer);
-    ngx_add_timer(&alias->connect_timer, random_interval());
+    ngx_close_connection(serverlist->peer_conn.connection);
+    serverlist->peer_conn.connection = NULL;
+    ngx_destroy_pool(serverlist->new_pool);
+    serverlist->new_pool = NULL;
+    ngx_del_timer(&serverlist->timeout_timer);
+    ngx_add_timer(&serverlist->connect_timer, random_interval());
 }
 
 static void
 empty_handler(ngx_event_t *ev) {
-    ngx_log_debug(NGX_LOG_DEBUG, ev->log, 0, "upstream-alias: empty handler");
+    ngx_log_debug(NGX_LOG_DEBUG, ev->log, 0, "upstream-serverlist: empty handler");
 }
 
 static void
@@ -782,22 +786,22 @@ dump_one_upstream(ngx_http_upstream_srv_conf_t *uscf, ngx_buf_t *b) {
 
 static ngx_int_t
 dump_upstreams(ngx_http_request_t *r) {
-    ngx_buf_t                             *b;
-    ngx_int_t                              rc, ret;
-    ngx_str_t                             *host;
-    ngx_uint_t                             i;
-    ngx_chain_t                            out;
-    ngx_http_upstream_srv_conf_t         **uscfp = NULL;
-    ngx_http_upstream_main_conf_t         *umcf;
-    ngx_http_upstream_alias_main_conf_t   *main_cf;
-    ngx_http_upstream_alias_t             *alias;
-    size_t                                 buf_size = NGX_PAGE_SIZE * NGX_PAGE_NUMBER;
+    ngx_buf_t                                *b;
+    ngx_int_t                                 rc, ret;
+    ngx_str_t                                *host;
+    ngx_uint_t                                i;
+    ngx_chain_t                               out;
+    ngx_http_upstream_srv_conf_t            **uscfp = NULL;
+    ngx_http_upstream_main_conf_t            *umcf;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf;
+    ngx_http_upstream_serverlist_t           *serverlist;
+    size_t                                    buf_size = NGX_PAGE_SIZE * NGX_PAGE_NUMBER;
 
     umcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
                                                ngx_http_upstream_module);
 
     main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
-                                                  ngx_http_upstream_alias_module);
+                                                  ngx_http_upstream_serverlist_module);
 
     uscfp = umcf->upstreams.elts;
 
@@ -827,14 +831,14 @@ dump_upstreams(ngx_http_request_t *r) {
     out.next = NULL;
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
-                           "alias_service_url: http://%V;\n",
-                           &main_cf->alias_service_url.url);
+                           "service_url: http://%V;\n",
+                           &main_cf->service_url.url);
 
-    for (i = 0; i < main_cf->aliases.nelts; i++) {
-        alias = (ngx_http_upstream_alias_t *)main_cf->aliases.elts + i;
+    for (i = 0; i < main_cf->serverlists.nelts; i++) {
+        serverlist = (ngx_http_upstream_serverlist_t *)main_cf->serverlists.elts + i;
         b->last = ngx_snprintf(b->last, b->end - b->last,
-                               "  upstream %V alias to %V;\n",
-                               &alias->upstream_conf->host, &alias->name);
+                               "  upstream %V serverlist to %V;\n",
+                               &serverlist->upstream_conf->host, &serverlist->name);
     }
 
     b->last = ngx_snprintf(b->last, b->end - b->last, "\n");
