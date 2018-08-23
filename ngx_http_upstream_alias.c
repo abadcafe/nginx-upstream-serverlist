@@ -715,12 +715,13 @@ recv_response_from_alias_service(ngx_event_t *ev) {
         goto fail;
     } else if (ret < 0) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-alias: unknown picohttpparser error");
+                      "upstream-alias: unknown picohttpparser error in alias %V",
+                      &alias->name);
         goto fail;
     } else if (status != 200) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                       "upstream-alias: response of alias %V is not 200: %d",
-                      status);
+                      &alias->name, status);
         goto fail;
     }
     alias->body.data = (u_char *)alias->recv.pos + ret;
