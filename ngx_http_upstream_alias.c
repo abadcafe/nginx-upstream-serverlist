@@ -371,7 +371,7 @@ connect_to_alias_service(ngx_event_t *ev) {
     return;
 
 fail:
-    ngx_close_connection(c);
+    ngx_close_connection(alias->peer_conn.connection);
     alias->peer_conn.connection = NULL;
     ngx_del_timer(&alias->timeout_timer);
     ngx_add_timer(&alias->connect_timer, random_interval());
@@ -420,7 +420,7 @@ send_request_to_alias_service(ngx_event_t *ev) {
     return;
 
 fail:
-    ngx_close_connection(c);
+    ngx_close_connection(alias->peer_conn.connection);
     alias->peer_conn.connection = NULL;
     ngx_destroy_pool(alias->new_pool);
     alias->new_pool = NULL;
@@ -723,13 +723,13 @@ recv_response_from_alias_service(ngx_event_t *ev) {
     alias->body.len = alias->recv.last - alias->recv.pos - ret;
 
     c->read->handler = empty_handler;
-    ngx_close_connection(c);
+    ngx_close_connection(alias->peer_conn.connection);
     alias->peer_conn.connection = NULL;
     refresh_upstream(alias);
     return;
 
 fail:
-    ngx_close_connection(c);
+    ngx_close_connection(alias->peer_conn.connection);
     alias->peer_conn.connection = NULL;
     ngx_destroy_pool(alias->new_pool);
     alias->new_pool = NULL;
