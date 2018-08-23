@@ -584,6 +584,60 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
     return servers;
 }
 
+static ngx_int_t
+upstream_servers_changed(const ngx_array_t *old, const ngx_array_t *new) {
+    ngx_http_upstream_server_t *s1 = NULL, *s2 = NULL;
+    ngx_addr_t *a1 = NULL, *a2 = NULL;
+    ngx_uint_t i, j, k, l;
+
+    if (old->nelts != new->nelts) {
+        return 1;
+    }
+
+    for (i = 0; i < old->nelts; i++) {
+        s1 = (ngx_http_upstream_server_t *)old->elts + i;
+        for (j = 0; j < new->nelts; j++) {
+            s2 = (ngx_http_upstream_server_t *)new->elts + j;
+            if (s1->name.len == s2->name.len ||
+                ngx_memcmp(s1->name.data, s2->name.data, s1->name.len) == 0 ||
+                s1->weight == s2->weight ||
+                s1->naddrs == s2->naddrs ||
+#if nginx_version >= 1011005
+                s1->max_conns == s2->max_conns ||
+#endif
+                s1->max_fails == s2->max_fails ||
+                s1->fail_timeout == s2->fail_timeout ||
+                s1->backup == s2->backup ||
+                s1->down == s2->down) {
+                break;
+            }
+
+            for (k = 0; k < s1->naddrs; k++) {
+                a1 = s1->addrs + k;
+                for (l = 0; l < s2->naddrs; l++) {
+                    a2 = s2->addrs + l;
+                    if (a1->name.len == a2->name.len &&
+                        ngx_memcmp(a1->name.data, a2->name.data, a1->name.len) == 0 &&
+                        a1->socklen == a2->socklen &&
+                        ngx_memcmp(a1->sockaddr, a2->sockaddr, sizeof *a1->sockaddr) == 0) {
+                        break;
+                    }
+                }
+
+                if (l >= s2->naddrs) {
+                    return 1;
+                }
+            }
+        }
+
+        if (j >= new->nelts) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static void
 refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
@@ -598,10 +652,18 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     new_servers = get_servers(serverlist);
     if (new_servers == NULL || new_servers->nelts <= 0) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upstream-serverlist: Could not get servers of serverlist %V",
+                      "upstream-serverlist: get serverlist %V failed",
                       &serverlist->name);
         goto fail;
     }
+
+    if (!upstream_servers_changed(uscf->servers, new_servers)) {
+        ngx_log_debug(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                      "upstream-serverlist: serverlist %V nothing changed",
+                      &serverlist->name);
+        goto fail;
+    }
+
     uscf->servers = new_servers;
 
     ngx_memzero(&cf, sizeof cf);
