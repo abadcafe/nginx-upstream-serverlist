@@ -511,7 +511,9 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                 server->naddrs = u.naddrs;
                 server->addrs = u.addrs;
                 server->weight = 1;
+#if nginx_version >= 1011005
                 server->max_conns = 0;
+#endif
                 server->max_fails = 1;
                 server->fail_timeout = 10;
 
@@ -527,6 +529,7 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                     }
 
                     server->weight = ret;
+#if nginx_version >= 1011005
                 } else if (ngx_strncmp(curr_arg.data, "max_conns=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
@@ -537,6 +540,7 @@ get_alias_servers(ngx_http_upstream_alias_t *alias) {
                     }
 
                     server->max_conns = ret;
+#endif
                 } else if (ngx_strncmp(curr_arg.data, "max_fails=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
