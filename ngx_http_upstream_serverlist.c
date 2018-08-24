@@ -158,8 +158,8 @@ create_main_conf(ngx_conf_t *cf) {
 
 static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
-    ngx_http_upstream_serverlist_main_conf_t  *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
-    ngx_int_t                                  ret = -1;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
+    ngx_int_t                                 ret = -1;
 
     main_cf->service_url.default_port = 80;
     main_cf->service_url.uri_part = 1;
@@ -598,18 +598,18 @@ upstream_servers_changed(const ngx_array_t *old, const ngx_array_t *new) {
         s1 = (ngx_http_upstream_server_t *)old->elts + i;
         for (j = 0; j < new->nelts; j++) {
             s2 = (ngx_http_upstream_server_t *)new->elts + j;
-            if (s1->name.len == s2->name.len ||
-                ngx_memcmp(s1->name.data, s2->name.data, s1->name.len) == 0 ||
-                s1->weight == s2->weight ||
-                s1->naddrs == s2->naddrs ||
+            if (s1->name.len != s2->name.len ||
+                ngx_memcmp(s1->name.data, s2->name.data, s1->name.len) != 0 ||
+                s1->weight != s2->weight ||
+                s1->naddrs != s2->naddrs ||
 #if nginx_version >= 1011005
-                s1->max_conns == s2->max_conns ||
+                s1->max_conns != s2->max_conns ||
 #endif
-                s1->max_fails == s2->max_fails ||
-                s1->fail_timeout == s2->fail_timeout ||
-                s1->backup == s2->backup ||
-                s1->down == s2->down) {
-                break;
+                s1->max_fails != s2->max_fails ||
+                s1->fail_timeout != s2->fail_timeout ||
+                s1->backup != s2->backup ||
+                s1->down != s2->down) {
+                continue;
             }
 
             for (k = 0; k < s1->naddrs; k++) {
