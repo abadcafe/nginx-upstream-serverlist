@@ -12,18 +12,19 @@ typedef struct {
     ngx_pool_t                   *pool;
     ngx_http_upstream_srv_conf_t *upstream_conf;
     ngx_str_t                     name;
-    ngx_event_t                   connect_timer;
+    ngx_event_t                   refresh_timer;
     ngx_event_t                   timeout_timer;
 
     ngx_peer_connection_t         peer_conn;
     ngx_buf_t                     send;
     ngx_buf_t                     recv;
     ngx_str_t                     body;
+    ngx_shmtx_t                   dump_file_lock; // to avoid parrallel write.
 } ngx_http_upstream_serverlist_t;
 
 typedef struct {
     ngx_url_t                     service_url;
-    ngx_str_t                     dump_path;
+    ngx_str_t                     dump_dir;
     ngx_array_t                   serverlists;
     ngx_http_conf_ctx_t          *conf_ctx;
 } ngx_http_upstream_serverlist_main_conf_t;
@@ -44,13 +45,16 @@ static char *
 dump_upstreams_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static ngx_int_t
+init_module(ngx_cycle_t *cycle);
+
+static ngx_int_t
 init_process(ngx_cycle_t *cycle);
 
 static void
 exit_process(ngx_cycle_t *cycle);
 
 static void
-connect_timeout_clean(ngx_event_t *ev);
+refresh_timeout_clean(ngx_event_t *ev);
 
 static void
 connect_to_service(ngx_event_t *ev);
@@ -112,7 +116,7 @@ ngx_module_t ngx_http_upstream_serverlist_module = {
     module_commands,                       /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    init_module,                           /* init module */
     init_process,                          /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -151,7 +155,7 @@ create_main_conf(ngx_conf_t *cf) {
 
     ngx_memzero(&main_cf->service_url, sizeof main_cf->service_url);
     ngx_str_set(&main_cf->service_url.url, "127.84.10.13/");
-    ngx_memzero(&main_cf->dump_path, sizeof main_cf->dump_path);
+    ngx_memzero(&main_cf->dump_dir, sizeof main_cf->dump_dir);
 
     return main_cf;
 }
@@ -160,15 +164,30 @@ static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
     ngx_int_t                                 ret = -1;
-
+    u_char                                    dump_dir[512] = {0};
+    struct stat                               statbuf = {0};
     main_cf->service_url.default_port = 80;
     main_cf->service_url.uri_part = 1;
     ret = ngx_parse_url(cf->pool, &main_cf->service_url);
     if (ret != NGX_OK) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-serverlist: parse service url failed: %s",
-                           main_cf->service_url.err);
+            "upstream-serverlist: parse service url failed: %s",
+            main_cf->service_url.err);
         return NGX_CONF_ERROR;
+    }
+
+    if (main_cf->dump_dir.len > 0) {
+        ngx_cpystrn(dump_dir, main_cf->dump_dir.data, main_cf->dump_dir.len);
+        ret = stat((const char *)dump_dir, &statbuf);
+        if (ret < 0) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
+                "upstream-serverlist: dump dir %s is not exists", dump_dir);
+            return NGX_CONF_ERROR;
+        } else if (!S_ISDIR(statbuf.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
+                "upstream-serverlist: dump path %s is not a dir", dump_dir);
+            return NGX_CONF_ERROR;
+        }
     }
 
     return NGX_CONF_OK;
@@ -177,31 +196,35 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
 static char *
 serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
-    ngx_str_t                                *url = (ngx_str_t *)cf->args->elts + 1;
+    ngx_str_t                                *s = NULL;
+    ngx_uint_t                                i;
 
-    if (cf->args->nelts < 2) {
+    if (cf->args->nelts <= 1) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-serverlist: serverlist_service need 1 arg",
-                           main_cf->service_url.err);
+            "upstream-serverlist: serverlist_service need at least 1 arg",
+            main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
-    if (url->len <= 7) {
-        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-serverlist: serverlist_service error",
-                           main_cf->service_url.err);
-        return NGX_CONF_ERROR;
-    }
+    for (i = 1; i < cf->args->nelts; i++) {
+        s = (ngx_str_t *)cf->args->elts + i;
 
-    if (ngx_strncasecmp(url->data, (u_char *)"http://", 7) != 0) {
-        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-serverlist: serverlist_service needs http prefix",
-                           main_cf->service_url.err);
-        return NGX_CONF_ERROR;
+        if (s->len > 4 && ngx_strncmp(s->data, "url=", 4) == 0) {
+            if (s->len > 4 + 7 && ngx_strncmp(s->data + 4, "http://", 7) == 0) {
+                main_cf->service_url.url.data = s->data + 4 + 7;
+                main_cf->service_url.url.len = s->len - 4 - 7;
+                continue;
+            } else {
+                ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                    "upstream-serverlist: serverlist_service only support http url");
+                return NGX_CONF_ERROR;
+            }
+        } else if (s->len > 9 && ngx_strncmp(s->data, "dump_dir=", 9) == 0) {
+            main_cf->dump_dir.data = s->data + 9;
+            main_cf->dump_dir.len = s->len - 9;
+            continue;
+        }
     }
-
-    main_cf->service_url.url.data = url->data + 7;
-    main_cf->service_url.url.len = url->len - 7;
 
     return NGX_CONF_OK;
 }
@@ -214,8 +237,8 @@ serverlist_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
 
     if (cf->args->nelts > 2) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                           "upstream-serverlist: serverlist only need 0 or 1 args",
-                           main_cf->service_url.err);
+            "upstream-serverlist: serverlist only need 0 or 1 args",
+            main_cf->service_url.err);
         return NGX_CONF_ERROR;
     }
 
@@ -233,29 +256,61 @@ serverlist_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
 }
 
 static ngx_int_t
+init_module(ngx_cycle_t *cycle) {
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_serverlist_t           *sl = main_cf->serverlists.elts;
+    ngx_shm_t shm = {0};
+    ngx_uint_t i = 0, cache_line_size = 128;
+    ngx_int_t ret = -1;
+
+#if !(NGX_HAVE_ATOMIC_OPS)
+    ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+        "upstream-serverlist: this module need ATOMIC_OPS support!!!");
+    return NGX_ERROR;
+#endif
+
+    // align to cache line to avoid false sharing.
+    shm.size = cache_line_size * main_cf->serverlists.nelts;
+    shm.log = cycle->log;
+    ngx_str_set(&shm.name, "upstream-serverlist-shared-zone");
+    if (ngx_shm_alloc(&shm) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < main_cf->serverlists.nelts; i++) {
+        sl = (ngx_http_upstream_serverlist_t *)main_cf->serverlists.elts + i;
+        ret = ngx_shmtx_create(&sl->dump_file_lock,
+            (ngx_shmtx_sh_t *)(shm.addr + cache_line_size * i), NULL);
+        if ( ret != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
 init_process(ngx_cycle_t *cycle) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_serverlist_module);
     ngx_http_upstream_serverlist_t           *serverlists = main_cf->serverlists.elts;
     ngx_uint_t i;
-    ngx_event_t *connect_timer = NULL, *timeout_timer = NULL;
-    ngx_uint_t refresh_in;
+    ngx_event_t *refresh_timer = NULL, *timeout_timer = NULL;
 
     for (i = 0; i < main_cf->serverlists.nelts; i++) {
-        connect_timer = &serverlists[i].connect_timer;
-        connect_timer->handler = connect_to_service;
-        connect_timer->log = cycle->log;
-        connect_timer->data = &serverlists[i];
+        refresh_timer = &serverlists[i].refresh_timer;
+        refresh_timer->handler = connect_to_service;
+        refresh_timer->log = cycle->log;
+        refresh_timer->data = &serverlists[i];
 
         timeout_timer = &serverlists[i].timeout_timer;
-        timeout_timer->handler = connect_timeout_clean;
+        timeout_timer->handler = refresh_timeout_clean;
         timeout_timer->log = cycle->log;
         timeout_timer->data = &serverlists[i];
 
-        refresh_in = random_interval();
-        ngx_log_debug(NGX_LOG_INFO, cycle->log, 0,
-                      "upstream-serverlist: Initialize refresh serverlist '%V' in %ims",
-                      &serverlists[i].name, refresh_in);
-        ngx_add_timer(connect_timer, refresh_in);
+        ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
+            "upstream-serverlist: add connect timer for serverlist %V",
+            &serverlists[i].name);
+        ngx_add_timer(refresh_timer, random_interval());
     }
 
     return NGX_OK;
@@ -272,16 +327,21 @@ exit_process(ngx_cycle_t *cycle) {
             ngx_destroy_pool(serverlists[i].pool);
             serverlists[i].pool = NULL;
         }
+
+        if (serverlists[i].peer_conn.connection) {
+            ngx_close_connection(serverlists[i].peer_conn.connection);
+            serverlists[i].peer_conn.connection = NULL;
+        }
     }
 }
 
 static void
-connect_timeout_clean(ngx_event_t *ev) {
+refresh_timeout_clean(ngx_event_t *ev) {
     ngx_http_upstream_serverlist_t *serverlist = ev->data;
 
     ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                  "upstream-serverlist: serverlist %V timeout",
-                  &serverlist->name);
+        "upstream-serverlist: serverlist %V refresh timeout",
+        &serverlist->name);
 
     if (serverlist->peer_conn.connection != NULL) {
         ngx_close_connection(serverlist->peer_conn.connection);
@@ -293,7 +353,7 @@ connect_timeout_clean(ngx_event_t *ev) {
         serverlist->new_pool = NULL;
     }
 
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
 }
 
 static void
@@ -307,23 +367,23 @@ connect_to_service(ngx_event_t *ev) {
         return;
     }
 
-    ngx_log_debug(NGX_LOG_INFO, ev->log, 0,
-                  "upstream-serverlist: start refresh serverlist %V",
-                  &serverlist->name);
+    ngx_log_debug(NGX_LOG_DEBUG_ALL, ev->log, 0,
+        "upstream-serverlist: start refresh serverlist %V", &serverlist->name);
 
     if (serverlist->new_pool != NULL) {
-        // the new pool may existed while previous refresh procedure failed.
-        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: new pool of serverlist %V is existing",
-                      &serverlist->name);
+        // unlikely, must be a critical bug if reached here.
+        ngx_log_error(NGX_LOG_CRIT, ev->log, 0,
+            "upstream-serverlist: new pool of serverlist %V is existing",
+            &serverlist->name);
         ngx_destroy_pool(serverlist->new_pool);
         serverlist->new_pool = NULL;
     }
 
     if (serverlist->peer_conn.connection != NULL) {
-        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: connection of serverlist %V is existing",
-                      &serverlist->name);
+        // unlikely and critical too.
+        ngx_log_error(NGX_LOG_CRIT, ev->log, 0,
+            "upstream-serverlist: connection of serverlist %V is existing",
+            &serverlist->name);
         ngx_close_connection(serverlist->peer_conn.connection);
         serverlist->peer_conn.connection = NULL;
     }
@@ -345,15 +405,15 @@ connect_to_service(ngx_event_t *ev) {
     ret = ngx_event_connect_peer(&serverlist->peer_conn);
     if (ret == NGX_ERROR || ret == NGX_DECLINED) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: connect to service_url failed: %V",
-                      &serverlist->peer_conn.name);
+            "upstream-serverlist: connect to service_url failed: %V",
+            &serverlist->peer_conn.name);
         goto fail;
     }
 
     serverlist->new_pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ev->log);
     if (serverlist->new_pool == NULL) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: Could not create new pool");
+            "upstream-serverlist: create new pool failed");
         goto fail;
     }
 
@@ -378,7 +438,7 @@ fail:
     ngx_close_connection(serverlist->peer_conn.connection);
     serverlist->peer_conn.connection = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
 }
 
 static void
@@ -392,32 +452,27 @@ send_to_service(ngx_event_t *ev) {
         return;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "upstream-serverlist: sending");
-
     u_char req[ngx_pagesize];
     ngx_memzero(req, sizeof req);
     ngx_sprintf(req, "GET %V?serverlist=%V HTTP/1.0\r\nHost: %V\r\n\r\n",
-                &main_cf->service_url.uri, &serverlist->name,
-                &main_cf->service_url.host);
+        &main_cf->service_url.uri, &serverlist->name,
+        &main_cf->service_url.host);
 
     serverlist->send.pos = req;
     serverlist->send.last = serverlist->send.pos + ngx_strlen(req);
     while (serverlist->send.pos < serverlist->send.last) {
-        size = c->send(c, serverlist->send.pos, serverlist->send.last - serverlist->send.pos);
+        size = c->send(c, serverlist->send.pos,
+            serverlist->send.last - serverlist->send.pos);
         if (size > 0) {
             serverlist->send.pos += size;
         } else if (size == 0 || size == NGX_AGAIN) {
             return;
         } else {
             c->error = 1;
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-serverlist: send error");
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                "upstream-serverlist: send error");
             goto fail;
         }
-    }
-
-    if (serverlist->send.pos == serverlist->send.last) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "upstream_serverlist_send: sent");
     }
 
     c->write->handler = empty_handler;
@@ -429,7 +484,7 @@ fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
 }
 
 static u_char *
@@ -489,9 +544,9 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
         while ((line_pos = get_one_arg(line_pos, line_end, &curr_arg)) != NULL) {
             if (!first_arg_found) {
                 if (ngx_strncmp(curr_arg.data, "server", curr_arg.len) != 0) {
-                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                  "upstream-serverlist: serverlist %V: expect 'server' prefix",
-                                  &serverlist->name);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log, 0,
+                        "upstream-serverlist: serverlist %V: expect 'server' prefix",
+                        &serverlist->name);
                     break;
                 }
 
@@ -503,9 +558,9 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                 u.default_port = 80;
                 ret = ngx_parse_url(serverlist->new_pool, &u);
                 if (ret != NGX_OK) {
-                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                  "upstream-serverlist: serverlist %V: parse addr failed",
-                                  &serverlist->name);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log, 0,
+                        "upstream-serverlist: serverlist %V: parse addr failed",
+                        &serverlist->name);
                     break;
                 }
 
@@ -526,9 +581,10 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                 if (ngx_strncmp(curr_arg.data, "weight=", 7) == 0) {
                     ret = ngx_atoi(curr_arg.data + 7, curr_arg.len - 7);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                      "upstream-serverlist: serverlist %V: weight invalid",
-                                      &serverlist->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log,
+                            0,
+                            "upstream-serverlist: serverlist %V: weight invalid",
+                            &serverlist->name);
                         continue;
                     }
 
@@ -537,9 +593,10 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                 } else if (ngx_strncmp(curr_arg.data, "max_conns=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                      "upstream-serverlist: serverlist %V: max_conns invalid",
-                                      &serverlist->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log,
+                            0,
+                            "upstream-serverlist: serverlist %V: max_conns invalid",
+                            &serverlist->name);
                         continue;
                     }
 
@@ -548,9 +605,10 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                 } else if (ngx_strncmp(curr_arg.data, "max_fails=", 10) == 0) {
                     ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                      "upstream-serverlist: serverlist %V: max_fails invalid",
-                                      &serverlist->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log,
+                            0,
+                            "upstream-serverlist: serverlist %V: max_fails invalid",
+                            &serverlist->name);
                         continue;
                     }
 
@@ -559,9 +617,10 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                     ngx_str_t time_str = {.data = curr_arg.data + 13, .len = curr_arg.len - 13};
                     ret = (ngx_int_t)ngx_parse_time(&time_str, 1);
                     if (ret == NGX_ERROR || ret == 0) {
-                        ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                      "upstream-serverlist: serverlist %V: fail_timeout invalid",
-                                      &serverlist->name);
+                        ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log,
+                            0,
+                            "upstream-serverlist: serverlist %V: fail_timeout invalid",
+                            &serverlist->name);
                         continue;
                     }
 
@@ -573,9 +632,9 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                 } else if (curr_arg.len == 1 && curr_arg.data[0] == ';') {
                     continue;
                 } else {
-                    ngx_log_error(NGX_LOG_ERR, serverlist->connect_timer.log, 0,
-                                  "upstream-serverlist: serverlist %V: unknown server option %V",
-                                  &serverlist->name, &curr_arg);
+                    ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log, 0,
+                        "upstream-serverlist: serverlist %V: unknown server option %V",
+                        &serverlist->name, &curr_arg);
                 }
             }
         }
@@ -638,11 +697,92 @@ upstream_servers_changed(const ngx_array_t *old, const ngx_array_t *new) {
     return 0;
 }
 
+static u_char *
+build_server_line(u_char *buf, size_t bufsize, const ngx_http_upstream_server_t *s) {
+    u_char *p = buf;
+
+    p = ngx_snprintf(buf, bufsize,
+        "server %V weight=%d max_fails=%d fail_timeout=%ds",&s->name, s->weight,
+        s->max_fails, s->fail_timeout);
+#if nginx_version >= 1011005
+    p = ngx_snprintf(p, bufsize - (p - buf), " max_conns=%d", s->max_conns);
+#endif
+
+    if (s->down) {
+        p = ngx_snprintf(p, bufsize - (p - buf), " down", s->down);
+    }
+
+    if (s->backup) {
+        p = ngx_snprintf(p, bufsize - (p - buf), " backup", s->backup);
+    }
+
+    p = ngx_snprintf(p, bufsize - (p - buf), ";", s->backup);
+
+    return p;
+}
+
+static void
+dump_serverlist(ngx_http_upstream_serverlist_t *serverlist) {
+    ngx_http_upstream_server_t               *s = NULL;
+    ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
+    ngx_uint_t i = 0;
+    ssize_t ret = 0;
+    ngx_fd_t fd = 0;
+    u_char buf[512] = {0}, tmpfile[512] = {0}, *p = NULL;
+
+    if (main_cf->dump_dir.len <= 0 ||
+        !ngx_shmtx_trylock(&serverlist->dump_file_lock)) {
+        return;
+    }
+
+    ngx_snprintf(tmpfile, sizeof tmpfile, "%V/.%V.conf.tmp", &main_cf->dump_dir,
+        &serverlist->name);
+    fd = ngx_open_file(tmpfile, NGX_FILE_WRONLY, NGX_FILE_TRUNCATE,
+        NGX_FILE_DEFAULT_ACCESS);
+    if (fd < 0) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+            "upstream-serverlist: open dump file %s failed", tmpfile);
+        goto unlock;
+    }
+
+    for (i = 0; i < serverlist->upstream_conf->servers->nelts; i++) {
+        s = (ngx_http_upstream_server_t *)serverlist->upstream_conf->servers->elts + i;
+
+        // reserve the last char to ensure the server line has the last '\n'.
+        p = build_server_line(buf, (sizeof buf) - 1, s);
+        *p = '\n';
+        p++;
+
+        ret = ngx_write_fd(fd, buf, p - buf);
+        if (ret < 0) {
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+                "upstream-serverlist: write dump file %s failed", tmpfile);
+            ngx_close_file(fd);
+            goto unlock;
+        }
+    }
+
+    ngx_close_file(fd);
+
+    ngx_memzero(buf, sizeof buf);
+    ngx_snprintf(buf, (sizeof buf) - 1, "%V/%V.conf", &main_cf->dump_dir,
+        &serverlist->name);
+    ret = ngx_rename_file(tmpfile, buf);
+    if (ret < 0) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, ngx_errno,
+            "upstream-serverlist: rename dump file %s failed", tmpfile);
+        goto unlock;
+    }
+
+unlock:
+    ngx_shmtx_unlock(&serverlist->dump_file_lock);
+}
+
 static void
 refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
     ngx_http_upstream_srv_conf_t             *uscf = serverlist->upstream_conf;
-    ngx_array_t                              *new_servers = NULL;
+    ngx_array_t                              *new_servers = NULL, *old_servers = NULL;
     ngx_conf_t                                cf = {0};
 
     if (whole_world_exiting()) {
@@ -652,19 +792,21 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     new_servers = get_servers(serverlist);
     if (new_servers == NULL || new_servers->nelts <= 0) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upstream-serverlist: get serverlist %V failed",
-                      &serverlist->name);
+            "upstream-serverlist: get serverlist %V failed", &serverlist->name);
         goto fail;
     }
 
     if (!upstream_servers_changed(uscf->servers, new_servers)) {
-        ngx_log_debug(NGX_LOG_DEBUG, ngx_cycle->log, 0,
-                      "upstream-serverlist: serverlist %V nothing changed",
-                      &serverlist->name);
+        ngx_log_debug(NGX_LOG_DEBUG_ALL, ngx_cycle->log, 0,
+            "upstream-serverlist: serverlist %V nothing changed",
+            &serverlist->name);
         goto fail;
     }
 
-    uscf->servers = new_servers;
+    ngx_http_upstream_init_pt init;
+    init = serverlist->upstream_conf->peer.init_upstream ?
+        serverlist->upstream_conf->peer.init_upstream :
+        ngx_http_upstream_init_round_robin;
 
     ngx_memzero(&cf, sizeof cf);
     cf.name = "serverlist_init_upstream";
@@ -675,39 +817,47 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     cf.log = ngx_cycle->log;
     cf.ctx = main_cf->conf_ctx;
 
-    ngx_http_upstream_init_pt init;
-    init = serverlist->upstream_conf->peer.init_upstream ?
-        serverlist->upstream_conf->peer.init_upstream :
-        ngx_http_upstream_init_round_robin;
+    old_servers = uscf->servers;
+    uscf->servers = new_servers;
 
     if (init(&cf, uscf) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "upstream-serverlist: Error re-initializing upstream");
+            "upstream-serverlist: reinitialize upstream %V failed, reverting",
+            &uscf->host);
+        cf.pool = serverlist->pool;
+        uscf->servers = old_servers;
+        init(&cf, uscf);
+        goto fail;
     }
+
+    ngx_log_debug(NGX_LOG_DEBUG_ALL, ngx_cycle->log, 0,
+        "upstream-serverlist: upstream %V reinitialized", &serverlist->name);
+    dump_serverlist(serverlist);
 
     if (serverlist->pool != NULL) {
         ngx_destroy_pool(serverlist->pool);
     }
     serverlist->pool = serverlist->new_pool;
     serverlist->new_pool = NULL;
+
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
     return;
 
 fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
 }
 
 static void
 recv_from_service(ngx_event_t *ev) {
-    ngx_int_t                              ret = -1;
-    u_char                                *new_buf;
-    ssize_t                                size, n;
-    ngx_connection_t                      *c = ev->data;
-    ngx_http_upstream_serverlist_t        *serverlist = c->data;
+    ngx_int_t                       ret = -1;
+    u_char                         *new_buf;
+    ssize_t                         size, n;
+    ngx_connection_t               *c = ev->data;
+    ngx_http_upstream_serverlist_t *serverlist = c->data;
 
     int minor_version = 0, status = 0;
     struct phr_header headers[32] = {0};
@@ -738,7 +888,7 @@ recv_from_service(ngx_event_t *ev) {
             new_buf = ngx_pcalloc(serverlist->new_pool, size * 2);
             if (new_buf == NULL) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                              "upstream-serverlist: allocate recv buf failed");
+                    "upstream-serverlist: allocate recv buf failed");
                 goto fail;
             }
             ngx_memcpy(new_buf, serverlist->recv.start, size);
@@ -760,7 +910,8 @@ recv_from_service(ngx_event_t *ev) {
             return;
         } else {
             c->error = 1;
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0, "upstream-serverlist: recv error");
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                "upstream-serverlist: recv error");
             goto fail;
         }
     }
@@ -771,23 +922,23 @@ recv_from_service(ngx_event_t *ev) {
                              &num_headers, 0);
     if (ret == -1) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: parse http headers of serverlist %V error",
-                      &serverlist->name);
+            "upstream-serverlist: parse http headers of serverlist %V error",
+            &serverlist->name);
         goto fail;
     } else if (ret == -2) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: response of serverlist %V is incomplete",
-                      &serverlist->name);
+            "upstream-serverlist: response of serverlist %V is incomplete",
+            &serverlist->name);
         goto fail;
     } else if (ret < 0) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: unknown picohttpparser error in serverlist %V",
-                      &serverlist->name);
+            "upstream-serverlist: unknown picohttpparser error in serverlist %V",
+            &serverlist->name);
         goto fail;
     } else if (status != 200) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                      "upstream-serverlist: response of serverlist %V is not 200: %d",
-                      &serverlist->name, status);
+            "upstream-serverlist: response of serverlist %V is not 200: %d",
+            &serverlist->name, status);
         goto fail;
     }
     serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
@@ -805,12 +956,13 @@ fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->connect_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval());
 }
 
 static void
 empty_handler(ngx_event_t *ev) {
-    ngx_log_debug(NGX_LOG_DEBUG, ev->log, 0, "upstream-serverlist: empty handler");
+    ngx_log_debug(NGX_LOG_DEBUG_ALL, ev->log, 0,
+        "upstream-serverlist: empty handler");
 }
 
 static void
