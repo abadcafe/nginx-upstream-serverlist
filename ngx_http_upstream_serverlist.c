@@ -580,7 +580,6 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
             } else if (!second_arg_found) {
                 ngx_memzero(&u, sizeof u);
                 u.url = curr_arg;
-                u.no_resolve = 1;
                 u.default_port = 80;
                 ret = ngx_parse_url(serverlist->new_pool, &u);
                 if (ret != NGX_OK) {
@@ -713,6 +712,8 @@ upstream_servers_changed(const ngx_array_t *old, const ngx_array_t *new) {
                     return 1;
                 }
             }
+
+            break;
         }
 
         if (j >= new->nelts) {
