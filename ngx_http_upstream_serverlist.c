@@ -237,11 +237,15 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
             itv = ngx_parse_time(&itv_str, 0);
             if (itv == NGX_ERROR || itv == 0) {
                 ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                    "upstream-serverlist: argument 'interval' invalid");
+                    "upstream-serverlist: argument 'interval' value invalid");
                 return NGX_CONF_ERROR;
             }
 
             refresh_interval_ms = itv;
+        } else {
+            ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "upstream-serverlist: argument '%V' format error", s);
+            return NGX_CONF_ERROR;
         }
     }
 
