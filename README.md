@@ -1,6 +1,6 @@
 # nginx-upstream-serverlist
 
-yet another nginx module for dynamiclly update upstream server list without
+Yet another nginx module for dynamiclly update upstream server list without
 reload or restart, and with simple and fully featured HTTP interface.
 
 Nginx's upstream can not dynamiclly modify the server directive's arguments. If
@@ -89,7 +89,7 @@ One `upstream block` can contain only one `serverlist` directive.
 The directive can optionally specify a `name` argument. If the argument absent,
 it means use upstream's name as serverlist's name. The URL to fetch `server`
 directives for the upstream will be
-`http://<serverlist_service's url>/<serverlist's name>`
+`http://[serverlist_service's url]/[serverlist's name]`
 
 ## Inspired By
 ### [nginx-upstream-dynamic-servers](https://github.com/GUI/nginx-upstream-dynamic-servers/)
