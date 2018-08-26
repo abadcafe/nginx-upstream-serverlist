@@ -168,6 +168,7 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     ngx_int_t                                 ret = -1;
     u_char                                    conf_dump_dir[512] = {0};
     struct stat                               statbuf = {0};
+
     main_cf->service_url.default_port = 80;
     main_cf->service_url.uri_part = 1;
     ret = ngx_parse_url(cf->pool, &main_cf->service_url);
@@ -176,6 +177,8 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
             "upstream-serverlist: parse service url failed: %s",
             main_cf->service_url.err);
         return NGX_CONF_ERROR;
+    } else if (main_cf->service_url.uri.len <= 0) {
+        ngx_str_set(&main_cf->service_url.uri, "/");
     }
 
     if (main_cf->conf_dump_dir.len > 0) {
@@ -477,7 +480,7 @@ send_to_service(ngx_event_t *ev) {
 
     u_char req[ngx_pagesize];
     ngx_memzero(req, sizeof req);
-    ngx_sprintf(req, "GET %V?serverlist=%V HTTP/1.0\r\nHost: %V\r\n\r\n",
+    ngx_sprintf(req, "GET %V/%V HTTP/1.0\r\nHost: %V\r\n\r\n",
         &main_cf->service_url.uri, &serverlist->name,
         &main_cf->service_url.host);
 
