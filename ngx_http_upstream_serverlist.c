@@ -24,7 +24,7 @@ typedef struct {
 
 typedef struct {
     ngx_url_t                     service_url;
-    ngx_str_t                     dump_dir;
+    ngx_str_t                     conf_dump_dir;
     ngx_array_t                   serverlists;
     ngx_http_conf_ctx_t          *conf_ctx;
 } ngx_http_upstream_serverlist_main_conf_t;
@@ -125,9 +125,11 @@ ngx_module_t ngx_http_upstream_serverlist_module = {
     NGX_MODULE_V1_PADDING
 };
 
+static ngx_int_t refresh_interval_ms = 5000;
+
 static ngx_int_t
 random_interval() {
-    return 2000 + ngx_random() % 500;
+    return refresh_interval_ms + ngx_random() % 500;
 }
 
 static ngx_int_t
@@ -155,7 +157,7 @@ create_main_conf(ngx_conf_t *cf) {
 
     ngx_memzero(&main_cf->service_url, sizeof main_cf->service_url);
     ngx_str_set(&main_cf->service_url.url, "127.84.10.13/");
-    ngx_memzero(&main_cf->dump_dir, sizeof main_cf->dump_dir);
+    ngx_memzero(&main_cf->conf_dump_dir, sizeof main_cf->conf_dump_dir);
 
     return main_cf;
 }
@@ -164,7 +166,7 @@ static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
     ngx_int_t                                 ret = -1;
-    u_char                                    dump_dir[512] = {0};
+    u_char                                    conf_dump_dir[512] = {0};
     struct stat                               statbuf = {0};
     main_cf->service_url.default_port = 80;
     main_cf->service_url.uri_part = 1;
@@ -176,16 +178,19 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
         return NGX_CONF_ERROR;
     }
 
-    if (main_cf->dump_dir.len > 0) {
-        ngx_cpystrn(dump_dir, main_cf->dump_dir.data, main_cf->dump_dir.len);
-        ret = stat((const char *)dump_dir, &statbuf);
+    if (main_cf->conf_dump_dir.len > 0) {
+        ngx_cpystrn(conf_dump_dir, main_cf->conf_dump_dir.data,
+            main_cf->conf_dump_dir.len);
+        ret = stat((const char *)conf_dump_dir, &statbuf);
         if (ret < 0) {
             ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
-                "upstream-serverlist: dump dir %s is not exists", dump_dir);
+                "upstream-serverlist: conf dump dir %s is not exists",
+                conf_dump_dir);
             return NGX_CONF_ERROR;
         } else if (!S_ISDIR(statbuf.st_mode)) {
             ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
-                "upstream-serverlist: dump path %s is not a dir", dump_dir);
+                "upstream-serverlist: conf dump path %s is not a dir",
+                conf_dump_dir);
             return NGX_CONF_ERROR;
         }
     }
@@ -210,19 +215,33 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
         s = (ngx_str_t *)cf->args->elts + i;
 
         if (s->len > 4 && ngx_strncmp(s->data, "url=", 4) == 0) {
-            if (s->len > 4 + 7 && ngx_strncmp(s->data + 4, "http://", 7) == 0) {
-                main_cf->service_url.url.data = s->data + 4 + 7;
-                main_cf->service_url.url.len = s->len - 4 - 7;
-                continue;
-            } else {
+            if (s->len > 4 + 7 && ngx_strncmp(s->data + 4, "http://", 7) != 0) {
                 ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
                     "upstream-serverlist: serverlist_service only support http url");
                 return NGX_CONF_ERROR;
             }
-        } else if (s->len > 9 && ngx_strncmp(s->data, "dump_dir=", 9) == 0) {
-            main_cf->dump_dir.data = s->data + 9;
-            main_cf->dump_dir.len = s->len - 9;
-            continue;
+
+            main_cf->service_url.url.data = s->data + 4 + 7;
+            main_cf->service_url.url.len = s->len - 4 - 7;
+        } else if (s->len > 14 && ngx_strncmp(s->data, "conf_dump_dir=", 14) == 0) {
+            main_cf->conf_dump_dir.data = s->data + 14;
+            main_cf->conf_dump_dir.len = s->len - 14;
+            if (ngx_conf_full_name(cf->cycle, &main_cf->conf_dump_dir, 1) != NGX_OK) {
+                ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                    "upstream-serverlist: get full path of conf_dump_dir failed");
+                return NGX_CONF_ERROR;
+            }
+        } else if (s->len > 9 && ngx_strncmp(s->data, "interval=", 9) == 0) {
+            ngx_str_t itv_str = {.data = s->data + 9, .len = s->len - 9};
+            ngx_int_t itv = 0;
+            itv = ngx_parse_time(&itv_str, 0);
+            if (itv == NGX_ERROR || itv == 0) {
+                ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                    "upstream-serverlist: argument 'interval' invalid");
+                return NGX_CONF_ERROR;
+            }
+
+            refresh_interval_ms = itv;
         }
     }
 
@@ -250,7 +269,7 @@ serverlist_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
     ngx_memzero(serverlist, sizeof *serverlist);
     serverlist->upstream_conf = uscf;
     serverlist->name = cf->args->nelts <= 1 ? uscf->host :
-                                              ((ngx_str_t *)cf->args->elts)[1];
+        ((ngx_str_t *)cf->args->elts)[1];
 
     return NGX_CONF_OK;
 }
@@ -615,7 +634,7 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
                     server->max_fails = ret;
                 } else if (ngx_strncmp(curr_arg.data, "fail_timeout=", 13) == 0) {
                     ngx_str_t time_str = {.data = curr_arg.data + 13, .len = curr_arg.len - 13};
-                    ret = (ngx_int_t)ngx_parse_time(&time_str, 1);
+                    ret = ngx_parse_time(&time_str, 1);
                     if (ret == NGX_ERROR || ret == 0) {
                         ngx_log_error(NGX_LOG_ERR, serverlist->refresh_timer.log,
                             0,
@@ -730,13 +749,13 @@ dump_serverlist(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_fd_t fd = 0;
     u_char buf[512] = {0}, tmpfile[512] = {0}, *p = NULL;
 
-    if (main_cf->dump_dir.len <= 0 ||
+    if (main_cf->conf_dump_dir.len <= 0 ||
         !ngx_shmtx_trylock(&serverlist->dump_file_lock)) {
         return;
     }
 
-    ngx_snprintf(tmpfile, sizeof tmpfile, "%V/.%V.conf.tmp", &main_cf->dump_dir,
-        &serverlist->name);
+    ngx_snprintf(tmpfile, sizeof tmpfile, "%V/.%V.conf.tmp",
+        &main_cf->conf_dump_dir, &serverlist->name);
     fd = ngx_open_file(tmpfile, NGX_FILE_WRONLY, NGX_FILE_TRUNCATE,
         NGX_FILE_DEFAULT_ACCESS);
     if (fd < 0) {
@@ -765,7 +784,7 @@ dump_serverlist(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_close_file(fd);
 
     ngx_memzero(buf, sizeof buf);
-    ngx_snprintf(buf, (sizeof buf) - 1, "%V/%V.conf", &main_cf->dump_dir,
+    ngx_snprintf(buf, (sizeof buf) - 1, "%V/%V.conf", &main_cf->conf_dump_dir,
         &serverlist->name);
     ret = ngx_rename_file(tmpfile, buf);
     if (ret < 0) {
@@ -822,7 +841,7 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
 
     if (init(&cf, uscf) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-            "upstream-serverlist: reinitialize upstream %V failed, reverting",
+            "upstream-serverlist: refresh upstream %V failed, rollback it",
             &uscf->host);
         cf.pool = serverlist->pool;
         uscf->servers = old_servers;
@@ -830,8 +849,8 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
         goto fail;
     }
 
-    ngx_log_debug(NGX_LOG_DEBUG_ALL, ngx_cycle->log, 0,
-        "upstream-serverlist: upstream %V reinitialized", &serverlist->name);
+    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+        "upstream-serverlist: upstream %V refreshed", &serverlist->name);
     dump_serverlist(serverlist);
 
     if (serverlist->pool != NULL) {
