@@ -6,10 +6,12 @@ reload or restart, and with simple and fully featured HTTP interface.
 Nginx's upstream can not dynamiclly modify the server directive's arguments. If
 someone wants add new servers, change server weight, or deal with other
 arguments like max_conns etc, he/she must reload or restart nginx, which may
-cause PV loss.This module add two directives: a) `serverlist`,
-b) `serverlist_service`, to resolve the problem.
+cause PV loss.
+
+This module add two directives: a) `serverlist`, b) `serverlist_service`, to resolve the problem.
 
 ## Installation
+The module must compile with nginx >= 1.11.0 .
 ```sh
 cd [nginx source directory]
 ./configure --add-module=[/path/to/nginx-upstream-serverlist]
