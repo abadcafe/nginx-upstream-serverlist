@@ -519,7 +519,7 @@ get_one_arg(u_char *buf, u_char *buf_end, ngx_str_t *arg) {
 
     for (pos = buf; pos < buf_end; pos++) {
         if (isalnum(*pos) ||
-            *pos == '=' || *pos == '.' || *pos == '-' || *pos == '_') {
+            *pos == '=' || *pos == '.' || *pos == '-' || *pos == '_' || *pos == ':') {
             break;
         }
     }
@@ -530,7 +530,7 @@ get_one_arg(u_char *buf, u_char *buf_end, ngx_str_t *arg) {
 
     for (arg_end = pos; arg_end < buf_end; arg_end++) {
         if (!isalnum(*arg_end) &&
-            *arg_end != '=' && *arg_end != '.' && *arg_end != '-' && *arg_end != '_') {
+            *arg_end != '=' && *arg_end != '.' && *arg_end != '-' && *arg_end != '_' && *arg_end != ':') {
             break;
         }
     }
@@ -1078,7 +1078,7 @@ dump_upstreams(ngx_http_request_t *r) {
     for (i = 0; i < main_cf->serverlists.nelts; i++) {
         serverlist = (ngx_http_upstream_serverlist_t *)main_cf->serverlists.elts + i;
         b->last = ngx_snprintf(b->last, b->end - b->last,
-                               "  upstream %V serverlist to %V;\n",
+                               "  upstream %V serverlist is %V;\n",
                                &serverlist->upstream_conf->host, &serverlist->name);
     }
 
