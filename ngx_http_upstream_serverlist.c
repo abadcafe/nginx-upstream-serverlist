@@ -4,8 +4,12 @@
 #include <nginx.h>
 #include "picohttpparser.h"
 
-#define NGX_PAGE_SIZE 4 * 1024
-#define NGX_PAGE_NUMBER 1024
+#define MAX_CONF_DUMP_PATH_LENGTH 512
+#define MAX_HTTP_REQUEST_SIZE 1024
+#define HTTP_REQUEST_TIMEOUT_MS 10000
+#define DEFAULT_REFRESH_INTERVAL_MS 5000
+#define DUMP_BUFFER_SIZE 512
+#define CACHE_LINE_SIZE 128
 
 typedef struct {
     ngx_pool_t                   *new_pool;
@@ -125,10 +129,10 @@ ngx_module_t ngx_http_upstream_serverlist_module = {
     NGX_MODULE_V1_PADDING
 };
 
-static ngx_int_t refresh_interval_ms = 5000;
+static ngx_int_t refresh_interval_ms = DEFAULT_REFRESH_INTERVAL_MS;
 
 static ngx_int_t
-random_interval() {
+random_interval_ms() {
     return refresh_interval_ms + ngx_random() % 500;
 }
 
@@ -166,7 +170,7 @@ static char *
 merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_serverlist_module);
     ngx_int_t                                 ret = -1;
-    u_char                                    conf_dump_dir[512] = {0};
+    u_char                                    conf_dump_dir[MAX_CONF_DUMP_PATH_LENGTH] = {0};
     struct stat                               statbuf = {0};
 
     main_cf->service_url.default_port = 80;
@@ -181,8 +185,15 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
         ngx_str_set(&main_cf->service_url.uri, "/");
     }
 
-    if (main_cf->conf_dump_dir.len > 0) {
-        ngx_cpystrn(conf_dump_dir, main_cf->conf_dump_dir.data,
+    if (main_cf->conf_dump_dir.len > sizeof conf_dump_dir) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
+            "upstream-serverlist: conf dump path %s is too long",
+            conf_dump_dir);
+        return NGX_CONF_ERROR;
+    } else if (main_cf->conf_dump_dir.len > 0) {
+        ngx_memzero(conf_dump_dir, sizeof conf_dump_dir);
+        ngx_memzero(&statbuf, sizeof statbuf);
+        ngx_memmove(conf_dump_dir, main_cf->conf_dump_dir.data,
             main_cf->conf_dump_dir.len);
         ret = stat((const char *)conf_dump_dir, &statbuf);
         if (ret < 0) {
@@ -286,7 +297,7 @@ init_module(ngx_cycle_t *cycle) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_serverlist_module);
     ngx_http_upstream_serverlist_t           *sl = main_cf->serverlists.elts;
     ngx_shm_t shm = {0};
-    ngx_uint_t i = 0, cache_line_size = 128;
+    ngx_uint_t i = 0;
     ngx_int_t ret = -1;
 
 #if !(NGX_HAVE_ATOMIC_OPS)
@@ -296,7 +307,7 @@ init_module(ngx_cycle_t *cycle) {
 #endif
 
     // align to cache line to avoid false sharing.
-    shm.size = cache_line_size * main_cf->serverlists.nelts;
+    shm.size = CACHE_LINE_SIZE * main_cf->serverlists.nelts;
     shm.log = cycle->log;
     ngx_str_set(&shm.name, "upstream-serverlist-shared-zone");
     if (ngx_shm_alloc(&shm) != NGX_OK) {
@@ -306,7 +317,7 @@ init_module(ngx_cycle_t *cycle) {
     for (i = 0; i < main_cf->serverlists.nelts; i++) {
         sl = (ngx_http_upstream_serverlist_t *)main_cf->serverlists.elts + i;
         ret = ngx_shmtx_create(&sl->dump_file_lock,
-            (ngx_shmtx_sh_t *)(shm.addr + cache_line_size * i), NULL);
+            (ngx_shmtx_sh_t *)(shm.addr + CACHE_LINE_SIZE * i), NULL);
         if ( ret != NGX_OK) {
             return NGX_ERROR;
         }
@@ -336,7 +347,7 @@ init_process(ngx_cycle_t *cycle) {
         ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
             "upstream-serverlist: add connect timer for serverlist %V",
             &serverlists[i].name);
-        ngx_add_timer(refresh_timer, random_interval());
+        ngx_add_timer(refresh_timer, random_interval_ms());
     }
 
     return NGX_OK;
@@ -379,7 +390,7 @@ refresh_timeout_clean(ngx_event_t *ev) {
         serverlist->new_pool = NULL;
     }
 
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
 }
 
 static void
@@ -427,7 +438,7 @@ connect_to_service(ngx_event_t *ev) {
     serverlist->peer_conn.sockaddr = &main_cf->service_url.sockaddr.sockaddr;
     serverlist->peer_conn.socklen = main_cf->service_url.socklen;
 
-    ngx_add_timer(&serverlist->timeout_timer, 10000);
+    ngx_add_timer(&serverlist->timeout_timer, HTTP_REQUEST_TIMEOUT_MS);
     ret = ngx_event_connect_peer(&serverlist->peer_conn);
     if (ret == NGX_ERROR || ret == NGX_DECLINED) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
@@ -464,25 +475,26 @@ fail:
     ngx_close_connection(serverlist->peer_conn.connection);
     serverlist->peer_conn.connection = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
 }
 
 static void
 send_to_service(ngx_event_t *ev) {
-    ssize_t                                   size;
+    ssize_t                                   size = -1;
     ngx_connection_t                         *c = ev->data;
     ngx_http_upstream_serverlist_t           *serverlist = c->data;
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
+    u_char                                    req[MAX_HTTP_REQUEST_SIZE] = {0};
 
     if (whole_world_exiting()) {
         return;
     }
 
-    u_char req[ngx_pagesize];
     ngx_memzero(req, sizeof req);
-    ngx_sprintf(req, "GET %V/%V HTTP/1.0\r\nHost: %V\r\n\r\n",
-        &main_cf->service_url.uri, &serverlist->name,
-        &main_cf->service_url.host);
+    ngx_sprintf(req, "GET %V%s%V HTTP/1.0\r\nHost: %V\r\n\r\n",
+        &main_cf->service_url.uri,
+        main_cf->service_url.uri.data[main_cf->service_url.uri.len - 1] == '/' ? "" : "/",
+        &serverlist->name, &main_cf->service_url.host);
 
     serverlist->send.pos = req;
     serverlist->send.last = serverlist->send.pos + ngx_strlen(req);
@@ -510,7 +522,13 @@ fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
+}
+
+static int
+is_valid_arg_char(u_char c) {
+    return isalnum(c) || c == '=' || c == '.' || c == '-' || c == '_' ||
+        c == ':';
 }
 
 static u_char *
@@ -518,8 +536,7 @@ get_one_arg(u_char *buf, u_char *buf_end, ngx_str_t *arg) {
     u_char *pos = NULL, *arg_end = NULL;
 
     for (pos = buf; pos < buf_end; pos++) {
-        if (isalnum(*pos) ||
-            *pos == '=' || *pos == '.' || *pos == '-' || *pos == '_' || *pos == ':') {
+        if (is_valid_arg_char(*pos)) {
             break;
         }
     }
@@ -529,8 +546,7 @@ get_one_arg(u_char *buf, u_char *buf_end, ngx_str_t *arg) {
     }
 
     for (arg_end = pos; arg_end < buf_end; arg_end++) {
-        if (!isalnum(*arg_end) &&
-            *arg_end != '=' && *arg_end != '.' && *arg_end != '-' && *arg_end != '_' && *arg_end != ':') {
+        if (!is_valid_arg_char(*arg_end)) {
             break;
         }
     }
@@ -672,7 +688,7 @@ static ngx_int_t
 upstream_servers_changed(const ngx_array_t *old, const ngx_array_t *new) {
     ngx_http_upstream_server_t *s1 = NULL, *s2 = NULL;
     ngx_addr_t *a1 = NULL, *a2 = NULL;
-    ngx_uint_t i, j, k, l;
+    ngx_uint_t i = 0, j = 0, k = 0, l = 0;
 
     if (old->nelts != new->nelts) {
         return 1;
@@ -753,9 +769,9 @@ dump_serverlist(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_http_upstream_server_t               *s = NULL;
     ngx_http_upstream_serverlist_main_conf_t *main_cf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_serverlist_module);
     ngx_uint_t i = 0;
-    ssize_t ret = 0;
-    ngx_fd_t fd = 0;
-    u_char buf[512] = {0}, tmpfile[512] = {0}, *p = NULL;
+    ssize_t ret = -1;
+    ngx_fd_t fd = -1;
+    u_char buf[DUMP_BUFFER_SIZE] = {0}, tmpfile[MAX_CONF_DUMP_PATH_LENGTH] = {0}, *p = NULL;
 
     if (main_cf->conf_dump_dir.len <= 0 ||
         !ngx_shmtx_trylock(&serverlist->dump_file_lock)) {
@@ -868,14 +884,14 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
     serverlist->new_pool = NULL;
 
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
     return;
 
 fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
 }
 
 static void
@@ -983,7 +999,7 @@ fail:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
-    ngx_add_timer(&serverlist->refresh_timer, random_interval());
+    ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
 }
 
 static void
@@ -1036,7 +1052,7 @@ dump_upstreams(ngx_http_request_t *r) {
     ngx_http_upstream_main_conf_t            *umcf;
     ngx_http_upstream_serverlist_main_conf_t *main_cf;
     ngx_http_upstream_serverlist_t           *serverlist;
-    size_t                                    buf_size = NGX_PAGE_SIZE * NGX_PAGE_NUMBER;
+    size_t                                    buf_size = 1048576;
 
     umcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
                                                ngx_http_upstream_module);
