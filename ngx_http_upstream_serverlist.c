@@ -306,6 +306,10 @@ init_module(ngx_cycle_t *cycle) {
     return NGX_ERROR;
 #endif
 
+    if (main_cf->serverlists.nelts <= 0) {
+        return NGX_OK;
+    }
+
     // align to cache line to avoid false sharing.
     shm.size = CACHE_LINE_SIZE * main_cf->serverlists.nelts;
     shm.log = cycle->log;
