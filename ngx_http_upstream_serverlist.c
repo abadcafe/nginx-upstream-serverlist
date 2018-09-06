@@ -6,6 +6,7 @@
 
 #define MAX_CONF_DUMP_PATH_LENGTH 512
 #define MAX_HTTP_REQUEST_SIZE 1024
+#define MAX_HTTP_RECEIVED_HEADERS 32
 #define HTTP_REQUEST_TIMEOUT_MS 10000
 #define DEFAULT_REFRESH_INTERVAL_MS 5000
 #define DUMP_BUFFER_SIZE 512
@@ -447,7 +448,7 @@ connect_to_service(ngx_event_t *ev) {
     if (ret == NGX_ERROR || ret == NGX_DECLINED) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: connect to service_url failed: %V",
-            &serverlist->peer_conn.name);
+            serverlist->peer_conn.name);
         goto fail;
     }
 
@@ -572,7 +573,7 @@ static ngx_array_t *
 get_servers(ngx_http_upstream_serverlist_t *serverlist) {
     ngx_int_t    ret = -1;
     ngx_array_t *servers = ngx_array_create(serverlist->new_pool, 2,
-                                            sizeof(ngx_http_upstream_server_t));
+        sizeof(ngx_http_upstream_server_t));
     ngx_http_upstream_server_t *server = NULL;
     ngx_url_t u = {0};
     ngx_str_t curr_line = {0};
@@ -907,7 +908,7 @@ recv_from_service(ngx_event_t *ev) {
     ngx_http_upstream_serverlist_t *serverlist = c->data;
 
     int minor_version = 0, status = 0;
-    struct phr_header headers[32] = {0};
+    struct phr_header headers[MAX_HTTP_RECEIVED_HEADERS] = {0};
     const char *msg = NULL;
     size_t msg_len = 0, num_headers = sizeof headers / sizeof headers[0];
 
