@@ -477,8 +477,10 @@ connect_to_service(ngx_event_t *ev) {
     return;
 
 fail:
-    ngx_close_connection(serverlist->peer_conn.connection);
-    serverlist->peer_conn.connection = NULL;
+    if (serverlist->peer_conn.connection != NULL) {
+        ngx_close_connection(serverlist->peer_conn.connection);
+        serverlist->peer_conn.connection = NULL;
+    }
     ngx_del_timer(&serverlist->timeout_timer);
     ngx_add_timer(&serverlist->refresh_timer, random_interval_ms());
 }
