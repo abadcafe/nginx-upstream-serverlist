@@ -24,7 +24,7 @@ One can use the two directives in `http block` and `upstream block` like below:
 
 <pre>
 http {
-  serverlist_service url=http://127.0.0.1/serverlists/
+  serverlist_service url=http://127.0.0.1/serverlists/  # or unix socket path.
   upstream test {
     serverlist test;
     server 127.255.255.255 down; # just a trick, explain later.
@@ -48,6 +48,10 @@ Supported `server` directive arguments include:
 * fail_timeout
 * down
 * backup
+
+NOTE: One can use "Last-Modified" or "Etag" HTTP header in response to prevent
+wasted upstream refresh actions, Especially when thousands serverlists and
+upstreams configured.
 
 ## Directives
 ### serverlist_service
