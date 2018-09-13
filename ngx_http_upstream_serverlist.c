@@ -1000,12 +1000,14 @@ get_last_modified_time(struct phr_header *headers, size_t num_headers) {
 
 static ngx_str_t
 get_etag(struct phr_header *headers, size_t num_headers) {
+    ngx_str_t etag = {0};
     struct phr_header *h = get_header(headers, num_headers, "Etag");
     if (h == NULL) {
-        return (time_t)-1;
+        return etag;
     }
 
-    ngx_str_t etag = {.len = h->value_len, .data = (u_char *)h->value};
+    etag.data = (u_char *)h->value;
+    etag.len = h->value_len;
     return etag;
 }
 
@@ -1017,30 +1019,6 @@ get_content_length(struct phr_header *headers, size_t num_headers) {
     }
 
     return ngx_atoi((u_char *)h->value, h->value_len);
-}
-
-static ngx_int_t
-get_content_length(struct phr_header *headers, size_t num_headers) {
-    struct phr_header *h = NULL;
-
-    if (headers == NULL) {
-        return -1;
-    }
-
-    for (size_t i = 0; i < num_headers; i++) {
-        h = &headers[i];
-
-        if (h->name == NULL && h->value == NULL) {
-            break;
-        }
-
-        if (ngx_strncasecmp((u_char *)h->name, (u_char *)"Content-Length",
-            h->name_len) == 0) {
-            return ngx_atoi((u_char *)h->value, h->value_len);
-        }
-    }
-
-    return -1;
 }
 
 static void
@@ -1107,8 +1085,6 @@ recv_from_service(ngx_event_t *ev) {
     serverlist->peer_conn.connection = NULL;
     c->read->handler = empty_handler;
 
-    ngx_str_t etag = {0};
-    ngx_int_t etag_changed = 0;
     ngx_int_t ret = -1;
     int minor_version = 0, status = 0;
     struct phr_header headers[MAX_HTTP_RECEIVED_HEADERS] = {0};
@@ -1136,57 +1112,61 @@ recv_from_service(ngx_event_t *ev) {
     } else if (status == 304) {
         // serverlist not modified.
         goto destroy_new_pool;
-    } else if (status == 200) {
-        time_t last_modified = -1;
-        ngx_int_t last_modified_changed = 0;
-        ngx_int_t content_length = -1;
-
-        serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
-        serverlist->body.len = serverlist->recv.last - serverlist->recv.pos - ret;
-
-        content_length = get_content_length(headers, num_headers);
-        if (content_length < 0 || content_length != (int)serverlist->body.len) {
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                "upstream-serverlist: serverlist %V content length error: %d",
-                &serverlist->name, content_length);
-            goto destroy_new_pool;
-        }
-
-        etag = get_etag(headers, num_headers);
-        if (etag.len > 0 &&
-            ngx_strncasecmp(serverlist->etag.data, etag.data,
-                serverlist->etag.len > etag.len ? etag.len : serverlist->etag.len) != 0) {
-            etag_changed = 1;
-        }
-
-        last_modified = get_last_modified_time(headers, num_headers);
-        if (last_modified >= 0 && last_modified > serverlist->last_modified) {
-            serverlist->last_modified = last_modified;
-            last_modified_changed = 1;
-        }
-
-        if (!etag_changed && (etag.len <= 0 && !last_modified_changed)) {
-            // serverlist not modified, again.
-            goto destroy_new_pool;
-        }
-
-        ret = refresh_upstream(serverlist);
-        if (ret < 0) {
-            serverlist->last_modified = -1;
-            ngx_memzero(&serverlist->etag, sizeof serverlist->etag);
-            goto destroy_new_pool;
-        }
-    } else {
+    } else if (status != 200) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: response of serverlist %V is not 200: %d",
             &serverlist->name, status);
         goto destroy_new_pool;
     }
 
-    if (etag_changed) {
-        // serverlist->etag was allocated in pools, so must update it only when
-        // new pool was ensured to replace the old pool.
-        serverlist->etag = etag;
+    ngx_str_t etag = {0};
+    time_t last_modified = -1;
+    ngx_int_t content_length = -1;
+
+    serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
+    serverlist->body.len = serverlist->recv.last - serverlist->recv.pos - ret;
+
+    content_length = get_content_length(headers, num_headers);
+    if (content_length < 0 || content_length != (int)serverlist->body.len) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+            "upstream-serverlist: serverlist %V content length error: %d",
+            &serverlist->name, content_length);
+        goto destroy_new_pool;
+    }
+
+    etag = get_etag(headers, num_headers);
+    if (etag.len > 0) {
+        if (serverlist->etag.len <= 0 ||
+            ngx_strncasecmp(serverlist->etag.data, etag.data,
+                serverlist->etag.len > etag.len ? etag.len : serverlist->etag.len) != 0) {
+            // be careful, pointed to new pool now!
+            serverlist->etag = etag;
+        } else {
+            goto destroy_new_pool;
+        }
+    } else if (serverlist->etag.len > 0) {
+        ngx_memzero(&serverlist->etag, sizeof serverlist->etag);
+    }
+
+    last_modified = get_last_modified_time(headers, num_headers);
+    if (last_modified >= 0) {
+        if (last_modified > serverlist->last_modified) {
+            serverlist->last_modified = last_modified;
+        } else if (etag.len <= 0) {
+            // serverlist->etag must pointed to old pool in this condition,
+            // so nothing to care.
+            goto destroy_new_pool;
+        }
+    } else {
+        serverlist->last_modified = -1;
+    }
+
+    ret = refresh_upstream(serverlist);
+    if (ret < 0) {
+        // ensure force refresh in next round, and clean pointers to new pool.
+        serverlist->last_modified = -1;
+        ngx_memzero(&serverlist->etag, sizeof serverlist->etag);
+        goto destroy_new_pool;
     }
 
     if (serverlist->pool != NULL) {
