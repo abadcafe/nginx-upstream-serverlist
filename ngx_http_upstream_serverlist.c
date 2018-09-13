@@ -655,6 +655,7 @@ get_servers(ngx_http_upstream_serverlist_t *serverlist) {
 
     u_char *body_pos = serverlist->body.data;
     u_char *body_end = serverlist->body.data + serverlist->body.len;
+
     do {
         ngx_memzero(&curr_line, sizeof curr_line);
         body_pos = get_one_line(body_pos, body_end, &curr_line);
@@ -919,7 +920,7 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
 
     ngx_http_upstream_srv_conf_t *uscf = serverlist->upstream_conf;
     if (!upstream_servers_changed(uscf->servers, new_servers)) {
-        ngx_log_debug(NGX_LOG_DEBUG_ALL, ngx_cycle->log, 0,
+        ngx_log_debug(NGX_LOG_INFO, ngx_cycle->log, 0,
             "upstream-serverlist: serverlist %V nothing changed",
             &serverlist->name);
         // once return -1, everything in the old pool will kept and the new pool
@@ -959,18 +960,16 @@ refresh_upstream(ngx_http_upstream_serverlist_t *serverlist) {
         return -1;
     }
 
-    ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
-        "upstream-serverlist: upstream %V refreshed", &serverlist->name);
     dump_serverlist(serverlist);
     return 0;
 }
 
-static time_t
-get_last_modified_time(struct phr_header *headers, size_t num_headers) {
+static struct phr_header *
+get_header(struct phr_header *headers, size_t num_headers, const char * name) {
     struct phr_header *h = NULL;
 
-    if (headers == NULL) {
-        return (time_t)-1;
+    if (headers == NULL || num_headers <= 0 || name == NULL) {
+        return NULL;
     }
 
     for (size_t i = 0; i < num_headers; i++) {
@@ -980,22 +979,52 @@ get_last_modified_time(struct phr_header *headers, size_t num_headers) {
             break;
         }
 
-        if (ngx_strncasecmp((u_char *)h->name, (u_char *)"Last-Modified",
+        if (ngx_strncasecmp((u_char *)h->name, (u_char *)name,
             h->name_len) == 0) {
-            return ngx_http_parse_time((u_char *)h->value, h->value_len);
+            return h;
         }
     }
 
-    return (time_t)-1;
+    return NULL;
+}
+
+static time_t
+get_last_modified_time(struct phr_header *headers, size_t num_headers) {
+    struct phr_header *h = get_header(headers, num_headers, "Last-Modified");
+    if (h == NULL) {
+        return (time_t)-1;
+    }
+
+    return ngx_http_parse_time((u_char *)h->value, h->value_len);
 }
 
 static ngx_str_t
 get_etag(struct phr_header *headers, size_t num_headers) {
+    struct phr_header *h = get_header(headers, num_headers, "Etag");
+    if (h == NULL) {
+        return (time_t)-1;
+    }
+
+    ngx_str_t etag = {.len = h->value_len, .data = (u_char *)h->value};
+    return etag;
+}
+
+static ngx_int_t
+get_content_length(struct phr_header *headers, size_t num_headers) {
+    struct phr_header *h = get_header(headers, num_headers, "Content-Length");
+    if (h == NULL) {
+        return -1;
+    }
+
+    return ngx_atoi((u_char *)h->value, h->value_len);
+}
+
+static ngx_int_t
+get_content_length(struct phr_header *headers, size_t num_headers) {
     struct phr_header *h = NULL;
-    ngx_str_t etag = {.len = 0, .data = NULL};
 
     if (headers == NULL) {
-        return etag;
+        return -1;
     }
 
     for (size_t i = 0; i < num_headers; i++) {
@@ -1005,15 +1034,13 @@ get_etag(struct phr_header *headers, size_t num_headers) {
             break;
         }
 
-        if (ngx_strncasecmp((u_char *)h->name, (u_char *)"Etag",
+        if (ngx_strncasecmp((u_char *)h->name, (u_char *)"Content-Length",
             h->name_len) == 0) {
-            etag.len = h->value_len;
-            etag.data = (u_char *)h->value;
-            return etag;
+            return ngx_atoi((u_char *)h->value, h->value_len);
         }
     }
 
-    return etag;
+    return -1;
 }
 
 static void
@@ -1080,6 +1107,8 @@ recv_from_service(ngx_event_t *ev) {
     serverlist->peer_conn.connection = NULL;
     c->read->handler = empty_handler;
 
+    ngx_str_t etag = {0};
+    ngx_int_t etag_changed = 0;
     ngx_int_t ret = -1;
     int minor_version = 0, status = 0;
     struct phr_header headers[MAX_HTTP_RECEIVED_HEADERS] = {0};
@@ -1093,31 +1122,40 @@ recv_from_service(ngx_event_t *ev) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: parse http headers of serverlist %V error",
             &serverlist->name);
-        goto fail_destroy_pool;
+        goto destroy_new_pool;
     } else if (ret == -2) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: response of serverlist %V is incomplete",
             &serverlist->name);
-        goto fail_destroy_pool;
+        goto destroy_new_pool;
     } else if (ret < 0) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: unknown picohttpparser error in serverlist %V",
             &serverlist->name);
-        goto fail_destroy_pool;
+        goto destroy_new_pool;
     } else if (status == 304) {
         // serverlist not modified.
-        goto exit;
+        goto destroy_new_pool;
     } else if (status == 200) {
         time_t last_modified = -1;
-        ngx_str_t etag = {0};
-        int etag_changed = 0;
-        int last_modified_changed = 0;
+        ngx_int_t last_modified_changed = 0;
+        ngx_int_t content_length = -1;
+
+        serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
+        serverlist->body.len = serverlist->recv.last - serverlist->recv.pos - ret;
+
+        content_length = get_content_length(headers, num_headers);
+        if (content_length < 0 || content_length != (int)serverlist->body.len) {
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                "upstream-serverlist: serverlist %V content length error: %d",
+                &serverlist->name, content_length);
+            goto destroy_new_pool;
+        }
 
         etag = get_etag(headers, num_headers);
         if (etag.len > 0 &&
             ngx_strncasecmp(serverlist->etag.data, etag.data,
                 serverlist->etag.len > etag.len ? etag.len : serverlist->etag.len) != 0) {
-            serverlist->etag = etag;
             etag_changed = 1;
         }
 
@@ -1129,23 +1167,28 @@ recv_from_service(ngx_event_t *ev) {
 
         if (!etag_changed && (etag.len <= 0 && !last_modified_changed)) {
             // serverlist not modified, again.
-            goto exit;
+            goto destroy_new_pool;
         }
 
-        serverlist->body.data = (u_char *)serverlist->recv.pos + ret;
-        serverlist->body.len = serverlist->recv.last - serverlist->recv.pos - ret;
         ret = refresh_upstream(serverlist);
         if (ret < 0) {
-            goto fail_destroy_pool;
+            serverlist->last_modified = -1;
+            ngx_memzero(&serverlist->etag, sizeof serverlist->etag);
+            goto destroy_new_pool;
         }
     } else {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: response of serverlist %V is not 200: %d",
             &serverlist->name, status);
-        goto fail_destroy_pool;
+        goto destroy_new_pool;
     }
 
-exit:
+    if (etag_changed) {
+        // serverlist->etag was allocated in pools, so must update it only when
+        // new pool was ensured to replace the old pool.
+        serverlist->etag = etag;
+    }
+
     if (serverlist->pool != NULL) {
         // the pool is NULL at first run.
         ngx_destroy_pool(serverlist->pool);
@@ -1161,7 +1204,7 @@ fail:
     serverlist->peer_conn.connection = NULL;
     c->read->handler = empty_handler;
 
-fail_destroy_pool:
+destroy_new_pool:
     ngx_destroy_pool(serverlist->new_pool);
     serverlist->new_pool = NULL;
     ngx_del_timer(&serverlist->timeout_timer);
