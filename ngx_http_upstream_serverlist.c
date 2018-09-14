@@ -173,9 +173,7 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf =
         ngx_http_conf_get_module_main_conf(cf,
             ngx_http_upstream_serverlist_module);
-    ngx_int_t                                 ret = -1;
-    u_char                                    conf_dump_dir[MAX_CONF_DUMP_PATH_LENGTH] = {0};
-    struct stat                               statbuf = {0};
+    ngx_int_t ret = -1;
 
     main_cf->service_url.default_port = 80;
     main_cf->service_url.uri_part = 1;
@@ -189,12 +187,15 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
         ngx_str_set(&main_cf->service_url.uri, "/");
     }
 
+    u_char conf_dump_dir[MAX_CONF_DUMP_PATH_LENGTH] = {0};
     if (main_cf->conf_dump_dir.len > sizeof conf_dump_dir) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
             "upstream-serverlist: conf dump path %s is too long",
             conf_dump_dir);
         return NGX_CONF_ERROR;
     } else if (main_cf->conf_dump_dir.len > 0) {
+        struct stat statbuf = {0};
+
         ngx_memzero(conf_dump_dir, sizeof conf_dump_dir);
         ngx_memzero(&statbuf, sizeof statbuf);
         ngx_memmove(conf_dump_dir, main_cf->conf_dump_dir.data,
@@ -221,8 +222,6 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
     ngx_http_upstream_serverlist_main_conf_t *main_cf =
         ngx_http_conf_get_module_main_conf(cf,
             ngx_http_upstream_serverlist_module);
-    ngx_str_t                                *s = NULL;
-    ngx_uint_t                                i;
 
     if (cf->args->nelts <= 1) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
@@ -230,6 +229,8 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
         return NGX_CONF_ERROR;
     }
 
+    ngx_str_t *s = NULL;
+    ngx_uint_t i;
     for (i = 1; i < cf->args->nelts; i++) {
         s = (ngx_str_t *)cf->args->elts + i;
 
