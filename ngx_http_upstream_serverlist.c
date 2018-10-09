@@ -639,7 +639,7 @@ send_to_service(ngx_event_t *ev) {
         return;
     }
 
-    ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
         "upstream-serverlist: send begin cur %d start %d end %d act %d ready %d",
         sc->serverlists_curr, sc->serverlists_start, sc->serverlists_end,
         c->write->active, c->write->ready);
@@ -724,7 +724,7 @@ send_to_service(ngx_event_t *ev) {
         goto fail;
     }
 
-    ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
         "upstream-serverlist: send end cur %d start %d end %d act %d ready %d",
         sc->serverlists_curr, sc->serverlists_start, sc->serverlists_end,
         c->write->active, c->write->ready);
@@ -1167,7 +1167,7 @@ recv_from_service(ngx_event_t *ev) {
         return;
     }
 
-    ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
         "upstream-serverlist: recv begin cur %d start %d end %d act %d ready %d",
         sc->serverlists_curr, sc->serverlists_start, sc->serverlists_end,
         c->read->active, c->read->ready);
@@ -1377,7 +1377,7 @@ exit:
 
     ngx_del_timer(&sc->timeout_timer);
 
-    ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+    ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
         "upstream-serverlist: recv end cur %d start %d end %d act %d ready %d",
         sc->serverlists_curr, sc->serverlists_start, sc->serverlists_end,
         c->read->active, c->read->ready);
