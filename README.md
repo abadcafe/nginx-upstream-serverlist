@@ -1,9 +1,9 @@
 # nginx-upstream-serverlist
 
-Yet another nginx module for dynamiclly update upstream server list without
+Yet another nginx module for dynamically update upstream server list without
 reload or restart, and with simple and fully featured HTTP interface.
 
-Nginx's upstream can not dynamiclly modify the server directive's arguments. If
+Nginx's upstream can not dynamically modify the server directive's arguments. If
 someone wants add new servers, change server weight, or deal with other
 arguments like max_conns etc, he/she must reload or restart nginx, which may
 cause PV loss.
@@ -55,7 +55,7 @@ upstreams configured.
 
 ## Directives
 ### serverlist_service
-* Syntax: `serverlist_service url=http://xxx/ [conf_dump_dir=dumped_dir/] [interval=5s];`
+* Syntax: `serverlist_service url=http://xxx/ [conf_dump_dir=dumped_dir/] [interval=5s] [concurrency=1];`
 * Context: `http`
 
 One `http block` can contain only one `serverlist_service` directive.
@@ -63,11 +63,11 @@ One `http block` can contain only one `serverlist_service` directive.
 The `url` argument specified where to request. It must be a HTTP URL, other
 protocol is not supported yet.
 
-The `conf_dump_dir` specified where responsed valid serverlists dump to. If
-`conf_dump_dir` is a relative path, it relative to nginx config directory. One
-can include dumped serverlist file in `upstream block` to ensure upstream has
-most recent `server` directives even after nginx restarted, to recover from
-serverlist service unavailable. Like blow:
+The `conf_dump_dir` argument specified where responsed valid serverlists dump
+to. If `conf_dump_dir` is a relative path, it relative to nginx config
+directory. One can include dumped serverlist file in `upstream block` to ensure
+upstream has most recent `server` directives even after nginx restarted, to
+recover from serverlist service unavailable. Like blow:
 
 <pre>
 http {
@@ -85,6 +85,9 @@ http {
   }
 }
 </pre>
+
+The `concurrency` argument specified how many connections per worker process
+will use to communicate to serverlist service. Default is 1.
 
 ### serverlist
 * Syntax: `serverlist [name];`
