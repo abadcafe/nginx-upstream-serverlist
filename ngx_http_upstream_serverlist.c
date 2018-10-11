@@ -38,6 +38,7 @@ typedef struct {
     ngx_int_t                     serverlists_start;
     ngx_int_t                     serverlists_end;
     ngx_int_t                     serverlists_curr;
+    ngx_time_t                    start_time;
 } service_conn;
 
 typedef struct {
@@ -533,8 +534,9 @@ connect_to_service(ngx_event_t *ev) {
     }
 
     ngx_log_error(NGX_LOG_INFO, ev->log, 0,
-        "upstream-serverlist: refresh serverlists from %u to %u",
+        "upstream-serverlist: start refresh serverlists from %d to %d",
         sc->serverlists_start, sc->serverlists_end);
+    sc->start_time = *ngx_timeofday();
 
     c = sc->peer_conn.connection;
     if (c && c->read->ready) {
@@ -1349,6 +1351,12 @@ recv_from_service(ngx_event_t *ev) {
 
 exit:
     if (sc->serverlists_curr + 1 >= sc->serverlists_end) {
+        ngx_time_t *now = ngx_timeofday();
+        ngx_log_error(NGX_LOG_INFO, ev->log, 0,
+            "upstream-serverlist: finished refresh serverlists from %d to %d, elapsed: %dms",
+            sc->serverlists_start, sc->serverlists_end,
+            (now->sec - sc->start_time.sec) * 1000 + now->msec - sc->start_time.msec);
+
         c->write->handler = empty_handler;
         c->read->handler = idle_conn_read_handler;
 
@@ -1440,7 +1448,7 @@ dump_upstreams(ngx_http_request_t *r) {
         ngx_http_upstream_serverlist_module);
     ngx_http_upstream_srv_conf_t **uscfp = umcf->upstreams.elts;
     serverlist *sl = NULL;
-    size_t buf_size = 1048576 * 4;
+    size_t buf_size = 1048576 * 16;
 
     if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
         return NGX_HTTP_NOT_ALLOWED;
