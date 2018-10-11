@@ -647,7 +647,7 @@ send_to_service(ngx_event_t *ev) {
         c->write->active, c->write->ready);
 
     c->write->ready = 0;
-    ngx_add_timer(&sc->timeout_timer, random_interval_ms());
+    ngx_add_timer(&sc->timeout_timer, DEFAULT_REFRESH_TIMEOUT_MS);
 
     if (sc->send.last == sc->send.start) {
         if (sc->serverlists_curr < 0) {
@@ -1091,12 +1091,13 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
 static struct phr_header *
 get_header(struct phr_header *headers, size_t num_headers, const char * name) {
     struct phr_header *h = NULL;
+    size_t i = 0;
 
     if (headers == NULL || num_headers <= 0 || name == NULL) {
         return NULL;
     }
 
-    for (size_t i = 0; i < num_headers; i++) {
+    for (i = 0; i < num_headers; i++) {
         h = &headers[i];
 
         if (h->name == NULL && h->value == NULL) {
@@ -1260,15 +1261,16 @@ recv_from_service(ngx_event_t *ev) {
                 goto close_connection;
             }
 
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                "upstream-serverlist: body incomplete");
+            ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
+                "upstream-serverlist: body incomplete: received %d, content length %d",
+                (int)sc->body.len, sc->content_length);
             // body incomplete.
             return;
         } else if (ret == 0) {
-            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                "upstream-serverlist: connection closed");
             // remote peer closed, leading 2 results: 1) header incomplete. 2)
             // body incomplete. every result need discard the connection.
+            ngx_log_error(NGX_LOG_INFO, ev->log, 0,
+                "upstream-serverlist: connection closed");
             goto close_connection;
         } else if (ret == NGX_AGAIN) {
             ngx_log_error(NGX_LOG_ERR, ev->log, 0,
