@@ -784,7 +784,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
     ngx_array_t *servers = ngx_array_create(pool, 2,
         sizeof(ngx_http_upstream_server_t));
     ngx_http_upstream_server_t *server = NULL;
-    ngx_url_t u = {0};
+    ngx_url_t u;
     ngx_str_t curr_line = {0};
     ngx_str_t curr_arg = {0};
 
@@ -1157,7 +1157,7 @@ recv_from_service(ngx_event_t *ev) {
     ngx_int_t ret = -1;
     u_char *new_buf = NULL;
     int minor_version = 0, status = 0;
-    struct phr_header headers[MAX_HTTP_RECEIVED_HEADERS] = {0};
+    struct phr_header headers[MAX_HTTP_RECEIVED_HEADERS] = {{0}};
     const char *msg = NULL;
     size_t prev_recv = 0, msglen = 0, bufsize = 0, freesize = 0;
     size_t num_headers = sizeof headers / sizeof headers[0];
