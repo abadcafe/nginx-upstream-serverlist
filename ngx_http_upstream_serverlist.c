@@ -35,9 +35,9 @@ typedef struct {
     ngx_int_t                     content_length;
     ngx_event_t                   refresh_timer;
     ngx_event_t                   timeout_timer;
-    ngx_int_t                     serverlists_start;
-    ngx_int_t                     serverlists_end;
-    ngx_int_t                     serverlists_curr;
+    ngx_uint_t                    serverlists_start;
+    ngx_uint_t                    serverlists_end;
+    ngx_uint_t                    serverlists_curr;
     ngx_time_t                    start_time;
 } service_conn;
 
@@ -211,7 +211,8 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
         if (s->len > 4 && ngx_strncmp(s->data, "url=", 4) == 0) {
             if (s->len > 4 + 7 && ngx_strncmp(s->data + 4, "http://", 7) != 0) {
                 ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                    "upstream-serverlist: serverlist_service only support http url");
+                    "upstream-serverlist: serverlist_service only support "
+                    "http url");
                 return NGX_CONF_ERROR;
             }
 
@@ -224,7 +225,8 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
             if (ngx_conf_full_name(cf->cycle, &mcf->conf_dump_dir,
                     1) != NGX_OK) {
                 ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                    "upstream-serverlist: get full path of 'conf_dump_dir' failed");
+                    "upstream-serverlist: get full path of 'conf_dump_dir' "
+                    "failed");
                 return NGX_CONF_ERROR;
             }
         } else if (s->len > 9 && ngx_strncmp(s->data, "interval=", 9) == 0) {
@@ -243,7 +245,8 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
             ret = ngx_atoi(s->data + 12, s->len - 12);
             if (ret == NGX_ERROR || ret == 0) {
                 ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
-                    "upstream-serverlist: argument 'concurrency' value invalid");
+                    "upstream-serverlist: argument 'concurrency' value "
+                    "invalid");
                 continue;
             }
 
@@ -421,7 +424,7 @@ init_process(ngx_cycle_t *cycle) {
             0 + blocksize * i);
         sc->serverlists_end = ngx_min(mcf->serverlists.nelts,
             sc->serverlists_start + blocksize);
-        sc->serverlists_curr = -1;
+        sc->serverlists_curr = sc->serverlists_start;
 
         sc->timeout_timer.handler = refresh_timeout_handler;
         sc->timeout_timer.log = cycle->log;
@@ -512,12 +515,10 @@ refresh_timeout_handler(ngx_event_t *ev) {
         sc->peer_conn.connection = NULL;
     }
 
-    if (sc->serverlists_curr >= 0) {
-        sl = (serverlist *)mcf->serverlists.elts + sc->serverlists_curr;
-        if (sl->new_pool) {
-            ngx_destroy_pool(sl->new_pool);
-            sl->new_pool = NULL;
-        }
+    sl = (serverlist *)mcf->serverlists.elts + sc->serverlists_curr;
+    if (sl->new_pool) {
+        ngx_destroy_pool(sl->new_pool);
+        sl->new_pool = NULL;
     }
 
     ngx_add_timer(&sc->refresh_timer, random_interval_ms());
@@ -533,10 +534,14 @@ connect_to_service(ngx_event_t *ev) {
         return;
     }
 
-    ngx_log_error(NGX_LOG_INFO, ev->log, 0,
-        "upstream-serverlist: start refresh serverlists from %d to %d",
-        sc->serverlists_start, sc->serverlists_end);
-    sc->start_time = *ngx_timeofday();
+    ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
+        "upstream-serverlist: create connection for serverlists from %d to %d, "
+        "cursor %d", sc->serverlists_start, sc->serverlists_end,
+        sc->serverlists_curr);
+
+    if (sc->start_time.sec <= 0) {
+        sc->start_time = *ngx_timeofday();
+    }
 
     c = sc->peer_conn.connection;
     if (c && c->read->ready) {
@@ -558,7 +563,6 @@ connect_to_service(ngx_event_t *ev) {
     sc->recv.pos = sc->recv.last = sc->recv.start;
     sc->send.pos = sc->send.last = sc->send.start;
     sc->content_length = -1;
-    sc->serverlists_curr = -1;
 
     c = sc->peer_conn.connection;
     c->data = sc;
@@ -570,12 +574,30 @@ connect_to_service(ngx_event_t *ev) {
     c->read->log = c->log;
     c->write->handler = send_to_service;
     c->read->handler = recv_from_service;
-    ngx_add_event(c->write, NGX_WRITE_EVENT, 0);
-    ngx_del_event(c->read, NGX_READ_EVENT, 0);
+
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+            "upstream-serverlist: handle write event failed");
+        goto fail;
+    }
+
+    if (ngx_del_event(c->read, NGX_READ_EVENT, 0) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+            "upstream-serverlist: del read event failed");
+        goto fail;
+    }
 
     if (ret == NGX_OK) {
         c->write->handler(c->write);
     }
+
+    return;
+
+fail:
+    ngx_close_connection(sc->peer_conn.connection);
+    sc->peer_conn.connection = NULL;
+    ngx_del_timer(&sc->timeout_timer);
+    ngx_add_timer(&sc->refresh_timer, random_interval_ms());
 }
 
 // copy from ngx_http_ustream.c
@@ -641,6 +663,14 @@ send_to_service(ngx_event_t *ev) {
         return;
     }
 
+    if (sc->serverlists_curr >= sc->serverlists_end) {
+        ngx_log_error(NGX_LOG_CRIT, ev->log, 0,
+            "upstream-serverlist: cursor %d exceed serverlists upper "
+            "bound %d", sc->serverlists_curr, sc->serverlists_end);
+        sc->serverlists_curr = sc->serverlists_start;
+        goto fail;
+    }
+
     ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
         "upstream-serverlist: send begin cur %d start %d end %d act %d ready %d",
         sc->serverlists_curr, sc->serverlists_start, sc->serverlists_end,
@@ -650,12 +680,6 @@ send_to_service(ngx_event_t *ev) {
     ngx_add_timer(&sc->timeout_timer, DEFAULT_REFRESH_TIMEOUT_MS);
 
     if (sc->send.last == sc->send.start) {
-        if (sc->serverlists_curr < 0) {
-            sc->serverlists_curr = sc->serverlists_start;
-        } else {
-            sc->serverlists_curr++;
-        }
-
         sl = (serverlist *)mcf->serverlists.elts + sc->serverlists_curr;
         if (sc->serverlists_curr == 0 && test_connect(c) != NGX_OK) {
             ngx_log_error(NGX_LOG_ERR, ev->log, 0,
@@ -697,8 +721,7 @@ send_to_service(ngx_event_t *ev) {
         }
 
         sc->send.last = ngx_snprintf(sc->send.last,
-            sc->send.end - sc->send.last,
-            "Connection: Keep-Alive\r\n\r\n");
+            sc->send.end - sc->send.last, "Connection: Keep-Alive\r\n\r\n");
     }
 
     while (sc->send.pos < sc->send.last) {
@@ -717,7 +740,13 @@ send_to_service(ngx_event_t *ev) {
 
     // send is over, cleaning.
     sc->send.pos = sc->send.last = sc->send.start;
-    ngx_del_event(c->write, NGX_WRITE_EVENT, 0);
+
+    ret = ngx_del_event(c->write, NGX_WRITE_EVENT, 0);
+    if (ret < 0) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+            "upstream-serverlist: del write event failed");
+        goto fail;
+    }
 
     ret = ngx_handle_read_event(c->read, 0);
     if (ret < 0) {
@@ -1218,26 +1247,25 @@ recv_from_service(ngx_event_t *ev) {
                 &status, &msg, &msglen, headers, &num_headers, prev_recv);
             if (ret == -1) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                    "upstream-serverlist: parse http headers of serverlist %V error",
-                    &sl->name);
+                    "upstream-serverlist: parse http headers of serverlist %V "
+                    "error", &sl->name);
                 goto close_connection;
             } else if (ret == -2) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                     "upstream-serverlist: header incomplete");
-                // http header incomplete.
                 return;
             } else if (ret < 0) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                    "upstream-serverlist: unknown picohttpparser error in serverlist %V",
-                    &sl->name);
+                    "upstream-serverlist: unknown picohttpparser error in "
+                    "serverlist %V", &sl->name);
                 goto close_connection;
             } else if (status == 304) {
                 // serverlist not modified.
                 goto exit;
             } else if (status != 200) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
-                    "upstream-serverlist: response of serverlist %V is not 200: %d",
-                    &sl->name, status);
+                    "upstream-serverlist: response of serverlist %V is not "
+                    "200: %d", &sl->name, status);
                 goto close_connection;
             }
 
@@ -1262,16 +1290,19 @@ recv_from_service(ngx_event_t *ev) {
             }
 
             ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
-                "upstream-serverlist: body incomplete: received %d, content length %d",
-                (int)sc->body.len, sc->content_length);
-            // body incomplete.
+                "upstream-serverlist: body incomplete: received %d, content "
+                "length %d", (int)sc->body.len, sc->content_length);
             return;
-        } else if (ret == 0) {
+        } else if (ret == 0 || ngx_socket_errno == NGX_ECONNRESET) {
             // remote peer closed, leading 2 results: 1) header incomplete. 2)
             // body incomplete. every result need discard the connection.
-            ngx_log_error(NGX_LOG_INFO, ev->log, 0,
+            ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
                 "upstream-serverlist: connection closed");
-            goto close_connection;
+            ngx_close_connection(sc->peer_conn.connection);
+            sc->peer_conn.connection = NULL;
+            ngx_del_timer(&sc->timeout_timer);
+            ngx_add_timer(&sc->refresh_timer, 1);
+            return;
         } else if (ret == NGX_AGAIN) {
             ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                 "upstream-serverlist: try again");
@@ -1355,10 +1386,13 @@ exit:
     if (sc->serverlists_curr + 1 >= sc->serverlists_end) {
         ngx_time_t *now = ngx_timeofday();
         ngx_log_error(NGX_LOG_INFO, ev->log, 0,
-            "upstream-serverlist: finished refresh serverlists from %d to %d, elapsed: %dms",
-            sc->serverlists_start, sc->serverlists_end,
-            (now->sec - sc->start_time.sec) * 1000 + now->msec - sc->start_time.msec);
+            "upstream-serverlist: finished refresh serverlists from %d to %d, "
+            "elapsed: %dms", sc->serverlists_start, sc->serverlists_end,
+            (now->sec - sc->start_time.sec) * 1000 + now->msec
+                - sc->start_time.msec);
 
+        sc->serverlists_curr = sc->serverlists_start;
+        ngx_memzero(&sc->start_time, sizeof sc->start_time);
         c->write->handler = empty_handler;
         c->read->handler = idle_conn_read_handler;
 
@@ -1372,10 +1406,17 @@ exit:
         ngx_add_timer(&sc->refresh_timer, random_interval_ms());
     } else {
         // recv is over, cleaning.
+        sc->serverlists_curr++;
         sc->content_length = -1;
         sc->recv.pos = sc->recv.last = sc->recv.start;
         ngx_memzero(&sc->body, sizeof sc->body);
-        ngx_del_event(c->read, NGX_READ_EVENT, 0);
+
+        ret = ngx_del_event(c->read, NGX_READ_EVENT, 0);
+        if (ret < 0) {
+            ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                "upstream-serverlist: del read event failed");
+            goto close_connection;
+        }
 
         ret = ngx_handle_write_event(c->write, 0);
         if (ret < 0) {
