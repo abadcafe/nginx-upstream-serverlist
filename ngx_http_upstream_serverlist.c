@@ -477,6 +477,10 @@ idle_conn_read_handler(ngx_event_t *ev) {
     ngx_int_t ret = -1;
     char junk;
 
+    if (whole_world_exiting()) {
+        return;
+    }
+
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "idle conn read handler");
 
     if (c->close || c->read->timedout) {
@@ -505,6 +509,10 @@ refresh_timeout_handler(ngx_event_t *ev) {
         ngx_http_upstream_serverlist_module);
     service_conn *sc = ev->data;
     serverlist *sl = NULL;
+
+    if (whole_world_exiting()) {
+        return;
+    }
 
     ngx_log_error(NGX_LOG_ERR, ev->log, 0,
         "upstream-serverlist: refresh timeout start %d end %d curr %d",
@@ -1251,7 +1259,7 @@ recv_from_service(ngx_event_t *ev) {
                     "error", &sl->name);
                 goto close_connection;
             } else if (ret == -2) {
-                ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
                     "upstream-serverlist: header incomplete");
                 return;
             } else if (ret < 0) {
