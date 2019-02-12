@@ -4,6 +4,10 @@
 #include <nginx.h>
 #include "picohttpparser.h"
 
+#if (NGX_HTTP_UPSTREAM_CHECK)
+#include "ngx_http_upstream_check_module.h"
+#endif
+
 #define MAX_CONF_DUMP_PATH_LENGTH 512
 #define MAX_HTTP_REQUEST_SIZE 1024
 #define MAX_HTTP_RECEIVED_HEADERS 32
@@ -218,8 +222,8 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
 
             mcf->service_url.url.data = s->data + 4 + 7;
             mcf->service_url.url.len = s->len - 4 - 7;
-        } else if (s->len > 14 &&
-            ngx_strncmp(s->data, "conf_dump_dir=", 14) == 0) {
+        } else if (s->len > 14 && ngx_strncmp(s->data, "conf_dump_dir=",
+                14) == 0) {
             mcf->conf_dump_dir.data = s->data + 14;
             mcf->conf_dump_dir.len = s->len - 14;
             if (ngx_conf_full_name(cf->cycle, &mcf->conf_dump_dir,
@@ -381,6 +385,11 @@ init_process(ngx_cycle_t *cycle) {
     ngx_uint_t i = 0;
     ngx_uint_t blocksize = 0;
 
+    if (ngx_process != NGX_PROCESS_WORKER
+            && ngx_process != NGX_PROCESS_SINGLE) {
+        return NGX_OK;
+    }
+
     if (mcf->serverlists.nelts >= mcf->service_concurrency) {
         blocksize = (mcf->serverlists.nelts + (mcf->service_concurrency - 1))
             / mcf->service_concurrency;
@@ -389,6 +398,7 @@ init_process(ngx_cycle_t *cycle) {
     }
 
     for (i = 0; i < mcf->service_concurrency; i++) {
+        // todo: fix bug.
         service_conn *sc = ngx_array_push(&mcf->service_conns);
         ngx_memzero(sc, sizeof *sc);
 
@@ -871,7 +881,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
                 second_arg_found = 1;
             } else if (ngx_strncmp(curr_arg.data, "weight=", 7) == 0) {
                 ret = ngx_atoi(curr_arg.data + 7, curr_arg.len - 7);
-                if (ret == NGX_ERROR || ret == 0) {
+                if (ret == NGX_ERROR || ret <= 0) {
                     ngx_log_error(NGX_LOG_ERR, log, 0,
                         "upstream-serverlist: weight invalid");
                     continue;
@@ -881,7 +891,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
 #if nginx_version >= 1011005
             } else if (ngx_strncmp(curr_arg.data, "max_conns=", 10) == 0) {
                 ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
-                if (ret == NGX_ERROR || ret == 0) {
+                if (ret == NGX_ERROR) {
                     ngx_log_error(NGX_LOG_ERR, log, 0,
                         "upstream-serverlist: max_conns invalid");
                     continue;
@@ -891,7 +901,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
 #endif
             } else if (ngx_strncmp(curr_arg.data, "max_fails=", 10) == 0) {
                 ret = ngx_atoi(curr_arg.data + 10, curr_arg.len - 10);
-                if (ret == NGX_ERROR || ret == 0) {
+                if (ret == NGX_ERROR) {
                     ngx_log_error(NGX_LOG_ERR, log,
                         0,
                         "upstream-serverlist: max_fails invalid");
@@ -903,7 +913,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
                 ngx_str_t time_str = {.data = curr_arg.data + 13,
                     .len = curr_arg.len - 13};
                 ret = ngx_parse_time(&time_str, 1);
-                if (ret == NGX_ERROR || ret == 0) {
+                if (ret == NGX_ERROR) {
                     ngx_log_error(NGX_LOG_ERR, log, 0,
                         "upstream-serverlist: fail_timeout invalid");
                     continue;
@@ -1120,6 +1130,15 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
         init(&cf, uscf);
         return -1;
     }
+
+#if (NGX_HTTP_UPSTREAM_CHECK)
+    if (ngx_http_upstream_check_update_upstream_peers(uscf, cf.pool) !=
+            NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+            "upstream-serverlist: update check module upstream %V failed",
+            &uscf->host);
+    }
+#endif
 
     dump_serverlist(sl);
     return 0;
