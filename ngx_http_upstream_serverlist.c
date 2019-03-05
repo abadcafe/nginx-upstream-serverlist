@@ -11,7 +11,7 @@
 #define MAX_CONF_DUMP_PATH_LENGTH 512
 #define MAX_HTTP_REQUEST_SIZE 1024
 #define MAX_HTTP_RECEIVED_HEADERS 32
-#define DEFAULT_REFRESH_TIMEOUT_MS 1000
+#define DEFAULT_REFRESH_TIMEOUT_MS 2000
 #define DEFAULT_REFRESH_INTERVAL_MS 5000
 #define DEFAULT_SERVICE_CONCURRENCY 1
 #define DUMP_BUFFER_SIZE 512
@@ -150,6 +150,7 @@ ngx_module_t ngx_http_upstream_serverlist_module = {
 };
 
 static ngx_int_t refresh_interval_ms = DEFAULT_REFRESH_INTERVAL_MS;
+static ngx_int_t refresh_timeout_ms = DEFAULT_REFRESH_TIMEOUT_MS;
 
 static ngx_int_t
 random_interval_ms() {
@@ -244,6 +245,17 @@ serverlist_service_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy) {
             }
 
             refresh_interval_ms = itv;
+        } else if (s->len > 8 && ngx_strncmp(s->data, "timeout=", 8) == 0) {
+            ngx_str_t itv_str = {.data = s->data + 8, .len = s->len - 8};
+            ngx_int_t itv = 0;
+            itv = ngx_parse_time(&itv_str, 0);
+            if (itv == NGX_ERROR || itv == 0) {
+                ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                    "upstream-serverlist: argument 'timeout' value invalid");
+                return NGX_CONF_ERROR;
+            }
+
+            refresh_timeout_ms = itv;
         } else if (s->len > 12 && ngx_strncmp(s->data, "concurrency=",
                 12) == 0) {
             ret = ngx_atoi(s->data + 12, s->len - 12);
@@ -398,7 +410,6 @@ init_process(ngx_cycle_t *cycle) {
     }
 
     for (i = 0; i < mcf->service_concurrency; i++) {
-        // todo: fix bug.
         service_conn *sc = ngx_array_push(&mcf->service_conns);
         ngx_memzero(sc, sizeof *sc);
 
@@ -435,6 +446,10 @@ init_process(ngx_cycle_t *cycle) {
         sc->serverlists_end = ngx_min(mcf->serverlists.nelts,
             sc->serverlists_start + blocksize);
         sc->serverlists_curr = sc->serverlists_start;
+    }
+
+    for (i = 0; i < mcf->service_conns.nelts; i++) {
+        service_conn *sc = (service_conn *)mcf->service_conns.elts + i;
 
         sc->timeout_timer.handler = refresh_timeout_handler;
         sc->timeout_timer.log = cycle->log;
@@ -695,7 +710,7 @@ send_to_service(ngx_event_t *ev) {
         c->write->active, c->write->ready);
 
     c->write->ready = 0;
-    ngx_add_timer(&sc->timeout_timer, DEFAULT_REFRESH_TIMEOUT_MS);
+    ngx_add_timer(&sc->timeout_timer, refresh_timeout_ms);
 
     if (sc->send.last == sc->send.start) {
         sl = (serverlist *)mcf->serverlists.elts + sc->serverlists_curr;

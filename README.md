@@ -55,7 +55,7 @@ upstreams configured.
 
 ## Directives
 ### serverlist_service
-* Syntax: `serverlist_service url=http://xxx/ [conf_dump_dir=dumped_dir/] [interval=5s] [concurrency=1];`
+* Syntax: `serverlist_service url=http://xxx/ [conf_dump_dir=dumped_dir/] [interval=5s] [timeout=2s] [concurrency=1];`
 * Context: `http`
 
 One `http block` can contain only one `serverlist_service` directive.
