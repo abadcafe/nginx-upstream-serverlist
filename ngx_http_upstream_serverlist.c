@@ -861,7 +861,7 @@ get_servers(ngx_pool_t *pool, ngx_str_t *body, ngx_log_t *log) {
         u_char *line_pos = curr_line.data;
         u_char *line_end = curr_line.data + curr_line.len;
         while ((line_pos = get_one_arg(line_pos, line_end,
-            &curr_arg)) != NULL) {
+                &curr_arg)) != NULL) {
             if (!first_arg_found) {
                 if (ngx_strncmp(curr_arg.data, "server", curr_arg.len) != 0) {
                     ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -1334,7 +1334,7 @@ recv_from_service(ngx_event_t *ev) {
             ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
                 "upstream-serverlist: body incomplete: received %d, content "
                 "length %d", (int)sc->body.len, sc->content_length);
-            return;
+            continue;
         } else if (ret == 0 || ngx_socket_errno == NGX_ECONNRESET) {
             // remote peer closed, leading 2 results: 1) header incomplete. 2)
             // body incomplete. every result need discard the connection.
