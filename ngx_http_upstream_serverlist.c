@@ -1308,7 +1308,7 @@ recv_from_service(ngx_event_t *ev) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                     "upstream-serverlist: response of serverlist %V is not "
                     "200: %d", &sl->name, status);
-                goto close_connection;
+                goto exit;
             }
 
             content_length = get_content_length(headers, num_headers);
