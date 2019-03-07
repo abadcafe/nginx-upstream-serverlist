@@ -1261,6 +1261,11 @@ recv_from_service(ngx_event_t *ev) {
             }
 
             ngx_memcpy(new_buf, sc->recv.start, bufsize);
+
+            if (sc->body.data) {
+                sc->body.data = new_buf + (sc->body.data - sc->recv.start);
+            }
+
             sc->recv.pos = sc->recv.start = new_buf;
             sc->recv.last = new_buf + bufsize;
             sc->recv.end = new_buf + bufsize * 2;
@@ -1295,7 +1300,7 @@ recv_from_service(ngx_event_t *ev) {
             } else if (ret == -2) {
                 ngx_log_error(NGX_LOG_DEBUG, ev->log, 0,
                     "upstream-serverlist: header incomplete");
-                return;
+                continue;
             } else if (ret < 0) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                     "upstream-serverlist: unknown picohttpparser error in "
