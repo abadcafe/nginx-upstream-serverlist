@@ -19,16 +19,9 @@
 #define DEFAULT_SERVERLIST_POOL_SIZE 1024
 
 typedef struct {
-    ngx_int_t   count;
-    ngx_pool_t  *creater; // use create_pool create pool
-    ngx_pool_t  *pool;
-} pool_reference_ctx_t;
-
-typedef struct {
-    pool_reference_ctx_t           *new_pool;
-    pool_reference_ctx_t           *pool;
-    ngx_http_upstream_init_peer_pt old_peer_init;
-    ngx_http_upstream_srv_conf_t   *upstream_conf; // TODO: should be a array to
+    ngx_pool_t                   *new_pool;
+    ngx_pool_t                   *pool;
+    ngx_http_upstream_srv_conf_t *upstream_conf; // TODO: should be a array to
                                                  // store all upstreams which
                                                  // shared one serverlist.
     ngx_str_t                     name;
@@ -348,58 +341,6 @@ merge_server_conf(ngx_conf_t *cf, void *parent, void *child) {
     return NGX_CONF_OK;
 }
 
-
-// create pool with reference count
-static pool_reference_ctx_t *
-create_reference_pool(ngx_pool_t *pool, size_t size, ngx_log_t *log) {
-    pool_reference_ctx_t *rpool = NULL;
-
-    ngx_pool_t *new = NULL;
-    do {
-        new = ngx_create_pool(size, pool->log);
-        if (!new) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "create_reference_pool fail! size:%z", size);
-            break;
-        }
-
-        rpool = ngx_pnalloc(pool, sizeof(pool_reference_ctx_t));
-        if (!rpool) {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "create_reference_pool fail! size:%z",
-                          sizeof(pool_reference_ctx_t));
-            break;
-        }
-
-        rpool->count = 0;
-        rpool->creater = pool;
-        rpool->pool = new;
-    } while(0);
-
-    if (!rpool && new) {
-        ngx_destroy_pool(new);
-    }
-
-    return rpool;
-}
-
-// dec reference pool or destory
-static void
-destroy_reference_pool(pool_reference_ctx_t *rpool) {
-
-    do {
-        if (!rpool) break;
-
-        rpool->count--;
-        if (rpool->count > 0) break;
-
-        ngx_destroy_pool(rpool->pool);
-        rpool->pool = NULL;
-        ngx_pfree(rpool->creater, rpool);
-    } while(0);
-
-}
-
 static ngx_int_t
 init_module(ngx_cycle_t *cycle) {
     main_conf *mcf = ngx_http_cycle_get_module_main_conf(cycle,
@@ -525,8 +466,7 @@ exit_process(ngx_cycle_t *cycle) {
 
     for (i = 0; i < mcf->serverlists.nelts; i++) {
         if (sls[i].pool) {
-            // ngx_destroy_pool(sls[i].pool);
-            destroy_reference_pool(sls[i].pool);
+            ngx_destroy_pool(sls[i].pool);
             sls[i].pool = NULL;
         }
     }
@@ -600,8 +540,7 @@ refresh_timeout_handler(ngx_event_t *ev) {
 
     sl = (serverlist *)mcf->serverlists.elts + sc->serverlists_curr;
     if (sl->new_pool) {
-        // ngx_destroy_pool(sl->new_pool);
-        destroy_reference_pool(sl->new_pool);
+        ngx_destroy_pool(sl->new_pool);
         sl->new_pool = NULL;
     }
 
@@ -1147,65 +1086,17 @@ unlock:
     ngx_shmtx_unlock(&sl->dump_file_lock);
 }
 
-// serverlist's request clean handler
-static void
-ngx_http_serverlist_request_pool_destroyed(void * data) {
-    pool_reference_ctx_t *rpool = data;
-
-    destroy_reference_pool(rpool);
-}
-
-// serverlist module's peer.init
-static ngx_int_t
-ngx_http_serverlist_peer_init(ngx_http_request_t *r,
-                              ngx_http_upstream_srv_conf_t *us) {
-
-    ngx_uint_t i;
-    serverlist *sl = NULL;
-    main_conf *mcf =
-        ngx_http_get_module_main_conf(r, ngx_http_upstream_serverlist_module);
-
-    if (!mcf) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "serverlist main conf is null!!");
-        return NGX_ERROR;
-    }
-
-    for (i = 0; i < mcf->serverlists.nelts; i++) {
-        sl = (serverlist *)mcf->serverlists.elts + i;
-        if (sl->upstream_conf == us) {
-            break;
-        }
-    }
-
-    if (i == mcf->serverlists.nelts) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "can not find request's upstream conf:%p", us);
-        return NGX_ERROR;
-    }
-
-    ngx_pool_cleanup_t * cln = ngx_pool_cleanup_add(r->pool, 0);
-    cln->data = sl->pool;
-    cln->handler = ngx_http_serverlist_request_pool_destroyed;
-    sl->pool->count++;
-
-    return sl->old_peer_init(r,us);
-}
-
 static ngx_int_t
 refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
-
-    main_conf *mcf = NULL;
-    ngx_http_upstream_srv_conf_t *uscf = NULL;
+    main_conf *mcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
+        ngx_http_upstream_serverlist_module);
+    ngx_http_upstream_srv_conf_t *uscf = sl->upstream_conf;
     ngx_http_upstream_init_pt init = NULL;
     ngx_conf_t cf = {0};
     ngx_array_t *new_servers = NULL;
-    ngx_array_t *old_servers = NULL;
+    ngx_array_t *old_servers = uscf->servers;
 
-    mcf = ngx_http_cycle_get_module_main_conf(ngx_cycle,
-            ngx_http_upstream_serverlist_module);
-    uscf = sl->upstream_conf;
-    new_servers = get_servers(sl->new_pool->pool, body, log);
+    new_servers = get_servers(sl->new_pool, body, log);
     if (new_servers == NULL || new_servers->nelts <= 0) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
             "upstream-serverlist: parse serverlist %V failed", &sl->name);
@@ -1226,7 +1117,7 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
     ngx_memzero(&cf, sizeof cf);
     cf.name = "serverlist_init_upstream";
     cf.cycle = (ngx_cycle_t *) ngx_cycle;
-    cf.pool = sl->new_pool->pool;
+    cf.pool = sl->new_pool;
     cf.module_type = NGX_HTTP_MODULE;
     cf.cmd_type = NGX_HTTP_MAIN_CONF;
     cf.log = ngx_cycle->log;
@@ -1239,14 +1130,11 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
             "upstream-serverlist: refresh upstream %V failed, rollback it",
             &uscf->host);
-        cf.pool = sl->pool->pool;
+        cf.pool = sl->pool;
         uscf->servers = old_servers;
         init(&cf, uscf);
         return -1;
     }
-
-    sl->old_peer_init = uscf->peer.init;
-    uscf->peer.init = ngx_http_serverlist_peer_init;
 
 #if (NGX_HTTP_UPSTREAM_CHECK)
     if (ngx_http_upstream_check_update_upstream_peers(uscf, cf.pool) !=
@@ -1318,7 +1206,6 @@ get_content_length(struct phr_header *headers, size_t num_headers) {
 
     return ngx_atoi((u_char *)h->value, h->value_len);
 }
-
 
 static void
 recv_from_service(ngx_event_t *ev) {
@@ -1472,15 +1359,11 @@ recv_from_service(ngx_event_t *ev) {
         ngx_log_error(NGX_LOG_CRIT, ev->log, 0,
             "upstream-serverlist: new pool of sl %V is existing",
             &sl->name);
-        // ngx_destroy_pool(sl->new_pool);
-        destroy_reference_pool(sl->new_pool);
+        ngx_destroy_pool(sl->new_pool);
         sl->new_pool = NULL;
     }
 
-    // sl->new_pool = ngx_create_pool(DEFAULT_SERVERLIST_POOL_SIZE, ev->log);
-    sl->new_pool =
-        create_reference_pool(mcf->conf_pool,
-                              DEFAULT_SERVERLIST_POOL_SIZE, ev->log);
+    sl->new_pool = ngx_create_pool(DEFAULT_SERVERLIST_POOL_SIZE, ev->log);
     if (sl->new_pool == NULL) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
             "upstream-serverlist: create new pool failed");
@@ -1491,7 +1374,7 @@ recv_from_service(ngx_event_t *ev) {
     if (etag.len > 0) {
         if (sl->etag.len <= 0 || ngx_strncasecmp(sl->etag.data, etag.data,
                 ngx_min(sl->etag.len, etag.len)) != 0) {
-            sl->etag.data = ngx_pstrdup(sl->new_pool->pool, &etag);
+            sl->etag.data = ngx_pstrdup(sl->new_pool, &etag);
             if (!sl->etag.data) {
                 ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                     "upstream-serverlist: allocate etag data failed");
@@ -1499,6 +1382,8 @@ recv_from_service(ngx_event_t *ev) {
             }
             sl->etag.len = etag.len;
         } else {
+            ngx_destroy_pool(sl->new_pool);
+            sl->new_pool = NULL;
             goto exit;
         }
     } else if (sl->etag.len > 0) {
@@ -1510,6 +1395,8 @@ recv_from_service(ngx_event_t *ev) {
         if (last_modified > sl->last_modified) {
             sl->last_modified = last_modified;
         } else if (etag.len <= 0) {
+            ngx_destroy_pool(sl->new_pool);
+            sl->new_pool = NULL;
             goto exit;
         }
     } else {
@@ -1521,23 +1408,19 @@ recv_from_service(ngx_event_t *ev) {
         // ensure force refresh in next round, and clean pointers to new pool.
         sl->last_modified = -1;
         ngx_memzero(&sl->etag, sizeof sl->etag);
+        ngx_destroy_pool(sl->new_pool);
+        sl->new_pool = NULL;
         goto exit;
     }
 
     if (sl->pool != NULL) {
         // the pool is NULL at first run.
-        destroy_reference_pool(sl->pool);
+        ngx_destroy_pool(sl->pool);
     }
-    sl->new_pool->count = 1;
     sl->pool = sl->new_pool;
     sl->new_pool = NULL;
 
 exit:
-    if (sl->new_pool) {
-        destroy_reference_pool(sl->new_pool);
-        sl->new_pool = NULL;
-    }
-
     if (sc->serverlists_curr + 1 >= sc->serverlists_end) {
         ngx_time_t *now = ngx_timeofday();
         ngx_log_error(NGX_LOG_INFO, ev->log, 0,
@@ -1590,8 +1473,7 @@ exit:
     return;
 
 destroy_new_pool:
-    destroy_reference_pool(sl->new_pool);
-    // ngx_destroy_pool(sl->new_pool);
+    ngx_destroy_pool(sl->new_pool);
     sl->new_pool = NULL;
 
 close_connection:
