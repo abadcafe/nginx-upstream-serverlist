@@ -1096,7 +1096,9 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
     ngx_array_t *new_servers = NULL;
     ngx_array_t *old_servers = uscf->servers;
 
-    new_servers = get_servers(sl->new_pool, body, log);
+    // use mcf->pool, avoid coredump, will lead mem leak
+    // new_servers = get_servers(sl->new_pool, body, log);
+    new_servers = get_servers(mcf->conf_pool, body, log);
     if (new_servers == NULL || new_servers->nelts <= 0) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
             "upstream-serverlist: parse serverlist %V failed", &sl->name);
@@ -1117,7 +1119,8 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
     ngx_memzero(&cf, sizeof cf);
     cf.name = "serverlist_init_upstream";
     cf.cycle = (ngx_cycle_t *) ngx_cycle;
-    cf.pool = sl->new_pool;
+    // cf.pool = sl->new_pool;
+    cf.pool = mcf->conf_pool;
     cf.module_type = NGX_HTTP_MODULE;
     cf.cmd_type = NGX_HTTP_MAIN_CONF;
     cf.log = ngx_cycle->log;
@@ -1130,7 +1133,7 @@ refresh_upstream(serverlist *sl, ngx_str_t *body, ngx_log_t *log) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
             "upstream-serverlist: refresh upstream %V failed, rollback it",
             &uscf->host);
-        cf.pool = sl->pool;
+        // cf.pool = sl->pool;
         uscf->servers = old_servers;
         init(&cf, uscf);
         return -1;
